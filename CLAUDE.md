@@ -11,8 +11,8 @@ Currently milestone 1 (ledger schema + invariants); the spec is `docs/design.md`
 
 ## Map
 - `db/migrations/` — Flyway SQL; source of truth for schema and ledger invariants (see its CLAUDE.md)
-- `src/llmgw/ledger/` — accounts, postings, holds. Mostly `NotImplementedError` stubs; docstrings are the spec (see its CLAUDE.md)
-- `src/llmgw/db.py` — asyncpg pool and `transaction()` helper
+- `src/llmgw/ledger/` — accounts, idempotent postings, the hold lifecycle, and `check_ledger` (see its CLAUDE.md)
+- `src/llmgw/db.py` — asyncpg pool, `transaction()` helper, `require_transaction()`
 - `src/llmgw/config.py` — settings from `LLMGW_*` env vars
 - `src/llmgw/__main__.py` — CLI modes: gateway, worker, sweeper, reconciler (none implemented)
 - `tests/` — `conftest.py` applies migrations with plain asyncpg (no Flyway) and truncates tables per test (see its CLAUDE.md)
