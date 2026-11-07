@@ -1,0 +1,31 @@
+# Local dev. M1 needs Postgres only; Redis, the gateway, workers and the mock
+# provider are added in later milestones.
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: llmgw
+      POSTGRES_PASSWORD: llmgw
+      POSTGRES_DB: llmgw
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U llmgw -d llmgw"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  # One-shot: applies db/migrations, then exits.
+  flyway:
+    image: flyway/flyway:11
+    command: -url=jdbc:postgresql://postgres:5432/llmgw -user=llmgw -password=llmgw -connectRetries=10 migrate
+    volumes:
+      - ./db/migrations:/flyway/sql:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
