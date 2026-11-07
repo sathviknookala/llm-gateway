@@ -1,0 +1,34 @@
+[project]
+name = "llmgw"
+version = "0.1.0"
+description = "LLM gateway with a double-entry credit ledger and a Postgres-backed job queue"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "asyncpg>=0.30",
+    "structlog>=24.4",
+]
+
+[project.scripts]
+llmgw = "llmgw.__main__:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "hypothesis>=6.120",
+    "testcontainers>=4.9",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/llmgw"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-ra"
