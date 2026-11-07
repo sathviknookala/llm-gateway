@@ -21,6 +21,12 @@ async def create_pool(settings: Settings) -> asyncpg.Pool:
     )
 
 
+def require_transaction(conn: asyncpg.Connection) -> None:
+    """Ledger writes are multi-statement; outside a transaction they'd commit piecemeal."""
+    if not conn.is_in_transaction():
+        raise RuntimeError("ledger operations must run inside the caller's transaction")
+
+
 @asynccontextmanager
 async def transaction(pool: asyncpg.Pool) -> AsyncIterator[asyncpg.Connection]:
     """Acquire a connection and run the block in one transaction.

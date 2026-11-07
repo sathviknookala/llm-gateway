@@ -48,6 +48,31 @@ class EntrySpec:
 
 
 @dataclass(frozen=True)
+class OrgAccounts:
+    org_id: int
+    external: int
+    org_pool: int
+    provider_spend: int
+    retry_loss: int
+
+
+@dataclass(frozen=True)
+class TeamAccounts:
+    team_id: int
+    org_id: int
+    available: int
+    held: int
+
+
+@dataclass(frozen=True)
+class TeamSummary:
+    available: int
+    held: int
+    granted: int
+    spent: int
+
+
+@dataclass(frozen=True)
 class Posting:
     id: int
     org_id: int
@@ -67,3 +92,19 @@ class Hold:
     close_posting_id: int | None
     settled_amount: int | None
     expires_at: datetime
+
+
+@dataclass(frozen=True)
+class SettleResult:
+    """Outcome of settle().
+
+    charged is what the team paid: min(actual, hold amount). uncovered is the
+    reported cost above the hold (actual - amount, or 0). The ledger caps the
+    charge at the hold and flags the posting; reconciliation books the
+    uncovered part later.
+    """
+
+    hold: Hold
+    posting: Posting
+    charged: int
+    uncovered: int

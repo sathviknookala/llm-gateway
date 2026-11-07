@@ -13,5 +13,9 @@ class IdempotencyConflict(LedgerError):
     """An idempotency key was reused with a different request."""
 
 
+class HoldNotFound(LedgerError):
+    pass
+
+
 class InvalidHoldState(LedgerError):
     """The hold was already closed (settled, released or expired) by another path."""
