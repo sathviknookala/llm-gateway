@@ -256,3 +256,102 @@ async def test_upstream_timeout_settles_flagged_estimate(conn, database_url, poo
     assert hold["state"] == "settled"
     assert (await close_posting(conn, hold))["flagged"]
     await assert_consistent(conn)
+
+
+# --- client goes away ---------------------------------------------------------
+
+
+async def test_client_disconnect_settles_and_closes_upstream(conn, env, mock):
+    async with env.client.stream(
+        "POST", "/v1/chat/completions", json=body(max_tokens=200, tokens=200, delay_ms=20)
+    ) as r:
+        assert r.status_code == 200
+        seen = ""
+        async for piece in r.aiter_text():
+            seen += piece
+            if "tok3 " in seen:
+                break  # leaving the block closes the connection mid-stream
+
+    [hold] = await wait_closed(conn)
+    assert hold["state"] == "settled"
+    assert (await close_posting(conn, hold))["flagged"]
+    # Charged for the prompt estimate and some, not all, of the output.
+    assert cost(PRICE, PROMPT_EST, 4) <= hold["settled_amount"] < hold["amount"]
+    async with asyncio.timeout(5):
+        while mock.state.disconnected == 0:  # the gateway closed its upstream stream
+            await asyncio.sleep(0.02)
+    assert mock.state.completed == 0
+    await assert_consistent(conn)
+
+
+def _asgi_request(key: str, payload: dict):
+    """Drive ChatCompletions directly, to cancel its task the way a server shutdown would."""
+    import orjson
+
+    scope = {
+        "type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1", "method": "POST", "scheme": "http",
+        "path": "/v1/chat/completions", "raw_path": b"/v1/chat/completions",
+        "query_string": b"", "root_path": "",
+        "headers": [(b"authorization", f"Bearer {key}".encode()),
+                    (b"content-type", b"application/json")],
+        "client": ("127.0.0.1", 1), "server": ("127.0.0.1", 2),
+    }
+    sent_body = False
+
+    async def receive():
+        nonlocal sent_body
+        if not sent_body:
+            sent_body = True
+            return {"type": "http.request", "body": orjson.dumps(payload), "more_body": False}
+        await asyncio.Event().wait()  # the client never leaves
+
+    chunks: list[bytes] = []
+    streaming = asyncio.Event()
+
+    async def send(message):
+        chunks.append(message.get("body", b""))
+        if b"tok2 " in b"".join(chunks):
+            streaming.set()
+
+    return scope, receive, send, streaming
+
+
+@pytest.mark.parametrize("how", ["task-cancel-once", "task-cancel-repeatedly", "anyio-scope"])
+async def test_settle_survives_request_task_cancellation(conn, env, mock, how):
+    """The close must commit however the request is cancelled. anyio scope
+    cancellation (Starlette's task groups) is level-triggered and re-cancels every
+    await, including in `finally`; repeated Task.cancel() (a forced server
+    shutdown) breaks through a plain shield. The slow close below makes both
+    land while the close is in flight."""
+    closing = asyncio.Event()
+
+    async def slow_close(call):
+        closing.set()
+        await asyncio.sleep(0.3)
+
+    env.gw.before_close = slow_close
+    scope, receive, send, streaming = _asgi_request(env.key, body(max_tokens=100, tokens=100, delay_ms=20))
+    handler = ChatCompletions(env.gw)
+
+    if how == "anyio-scope":
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(handler, scope, receive, send)
+            await asyncio.wait_for(streaming.wait(), 5)
+            tg.cancel_scope.cancel()
+    else:
+        task = asyncio.create_task(handler(scope, receive, send))
+        await asyncio.wait_for(streaming.wait(), 5)
+        task.cancel()
+        if how == "task-cancel-repeatedly":
+            await asyncio.wait_for(closing.wait(), 5)
+            for _ in range(3):
+                await asyncio.sleep(0.05)
+                task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    [hold] = await wait_closed(conn)
+    assert hold["state"] == "settled"
+    assert (await close_posting(conn, hold))["flagged"]
+    await assert_consistent(conn)
