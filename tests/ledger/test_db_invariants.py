@@ -213,3 +213,12 @@ async def test_worked_example_from_design_doc(conn, accts):
     assert await balance(conn, accts.provider_spend) == 45
     total = await conn.fetchval("SELECT sum(amount) FROM balances")
     assert total == 0
+
+
+async def test_api_key_hash_is_32_bytes_and_unique(conn, accts):
+    insert = "INSERT INTO api_keys (team_id, key_hash, prefix) VALUES ($1, $2, 'llmgw_x')"
+    with pytest.raises(asyncpg.CheckViolationError):
+        await conn.execute(insert, accts.team_id, b"\x01" * 31)
+    await conn.execute(insert, accts.team_id, b"\x01" * 32)
+    with pytest.raises(asyncpg.UniqueViolationError):
+        await conn.execute(insert, accts.team_id, b"\x01" * 32)
