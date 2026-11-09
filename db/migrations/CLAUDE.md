@@ -1,5 +1,5 @@
 # db/migrations
-Responsibility: the ledger schema and every invariant the database enforces (triggers, CHECKs, unique indexes).
+Responsibility: the ledger schema and every invariant the database enforces (triggers, CHECKs, unique indexes), plus gateway tables (`api_keys`).
 Not responsible for: ledger operations or mapping DB errors to Python errors (that's `src/llmgw/ledger/`).
 
 ## Contract
@@ -18,6 +18,7 @@ Not responsible for: ledger operations or mapping DB errors to Python errors (th
 ## Entry points
 - `V1__ledger_tables.sql` — tables, enums, indexes, CHECKs.
 - `V2__ledger_invariants.sql` — triggers: balance row per account, balances moved by entries, deferred sum-zero check, append-only guard.
+- `V3__api_keys.sql` — team API keys: SHA-256 hash (32 bytes, unique), display prefix, `revoked_at`.
 
 ## Testing here
 - `uv run pytest tests/ledger/test_db_invariants.py` — applies all migrations to a fresh Postgres 17.
