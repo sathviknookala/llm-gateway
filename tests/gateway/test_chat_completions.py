@@ -355,3 +355,21 @@ async def test_settle_survives_request_task_cancellation(conn, env, mock, how):
     assert hold["state"] == "settled"
     assert (await close_posting(conn, hold))["flagged"]
     await assert_consistent(conn)
+
+
+# --- concurrency --------------------------------------------------------------
+
+
+async def test_concurrent_mixed_outcomes_keep_the_ledger_consistent(conn, env, mock):
+    scenarios = [{}, {"status": 429}, {"cut_after": 3}, {"no_usage": True}, {"prompt_tokens": 10_000}]
+    payloads = [body(**scenarios[i % len(scenarios)]) for i in range(40)]
+    results = await asyncio.gather(*(chat(env.client, p) for p in payloads))
+    assert {s for s, _, _ in results} == {200, 429}
+
+    rows = await wait_closed(conn)
+    assert len(rows) == 40
+    spent = await accounts.balance(conn, env.org.provider_spend)
+    assert spent == sum(r["settled_amount"] or 0 for r in rows)
+    assert await available(conn, env.team) == TEAM_GRANT - spent
+    assert await accounts.balance(conn, env.team.held) == 0
+    await assert_consistent(conn)
