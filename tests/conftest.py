@@ -10,7 +10,7 @@ import pytest
 from testcontainers.community.postgres import PostgresContainer
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "db" / "migrations"
-TABLES = ("holds", "entries", "postings", "balances", "accounts", "teams", "orgs")
+TABLES = ("api_keys", "holds", "entries", "postings", "balances", "accounts", "teams", "orgs")
 _VERSIONED = re.compile(r"^V(\d+)__.+\.sql$")
 
 
