@@ -1,5 +1,5 @@
 # tests
-Responsibility: proving the ledger can't lose or invent credits — schema invariants, ledger operations, concurrency, and property tests.
+Responsibility: proving the ledger can't lose or invent credits — schema invariants, ledger operations, concurrency, and property tests — and that the gateway closes every hold exactly once.
 Not responsible for: the Flyway check (CI's `migrations` job does that), load or fault tests (later milestones).
 
 ## Contract
@@ -20,6 +20,8 @@ Not responsible for: the Flyway check (CI's `migrations` job does that), load or
 - `ledger/test_checks.py` — `check_ledger` finds corruption.
 - `ledger/test_concurrency.py` — races via `pool` and `asyncio.gather`.
 - `ledger/test_ledger_properties.py` — Hypothesis `RuleBasedStateMachine` over the ledger API, checked against a Python model of every balance.
+- `gateway/test_chat_completions.py` — `/v1/chat/completions` end to end: usage settle, release on provider errors, flagged estimates on cut-offs and disconnects, cancellation of the request task, mixed concurrent traffic.
+- `gateway/conftest.py` — `mock` (mock provider on a real uvicorn server, `mock.state` records what it saw), `funded` (org, team A granted 1,000,000, API key), `env` (gateway on uvicorn plus an authenticated httpx client), and `gateway_env(...)` for settings overrides.
 
 ## Testing here
 - `uv run pytest` (Docker required); one file: `uv run pytest tests/ledger/test_db_invariants.py`.
@@ -32,3 +34,5 @@ Not responsible for: the Flyway check (CI's `migrations` job does that), load or
 - Fixture loop scope is `function`, so a session-scoped async fixture won't work. That's why `database_url` is sync and runs migrations with `asyncio.run`.
 - Hypothesis `RuleBasedStateMachine` rules are sync; `LedgerMachine` owns a private event loop and one connection, and truncates the tables itself. If you add a table, add it to its `TRUNCATE` too.
 - The first test in a run is slow: it starts the container and applies migrations.
+- Gateway tests run uvicorn via `server._serve(sockets=...)` to skip its signal-handler capture.
+- The gateway closes a hold after the client has seen the end of the stream, so poll with `wait_closed` before asserting on holds or balances.
