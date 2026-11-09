@@ -170,3 +170,42 @@ async def test_at_capacity_is_429(conn, env, mock):
         env.gw.inflight = 0
     assert r.status_code == 429 and r.headers["retry-after"] == "1"
     assert await holds(conn) == []
+
+
+# --- provider refused: release ------------------------------------------------
+
+
+async def test_provider_429_releases_and_passes_retry_after(conn, env, mock):
+    status, text, headers = await chat(env.client, body(status=429))
+    assert status == 429 and headers["retry-after"] == "1"
+    [hold] = await wait_closed(conn)
+    assert hold["state"] == "released"
+    assert await available(conn, env.team) == TEAM_GRANT
+    await assert_consistent(conn)
+
+
+async def test_provider_400_is_passed_through_and_released(conn, env, mock):
+    status, text, _ = await chat(env.client, body(status=400))
+    assert status == 400 and "mock error 400" in text
+    [hold] = await wait_closed(conn)
+    assert hold["state"] == "released"
+
+
+async def test_provider_500_is_502_and_released(conn, env, mock):
+    status, _, _ = await chat(env.client, body(status=500))
+    assert status == 502
+    [hold] = await wait_closed(conn)
+    assert hold["state"] == "released"
+
+
+async def test_provider_unreachable_releases(conn, database_url, pool, funded):
+    with socket.socket() as s:  # a port with nothing listening
+        s.bind(("127.0.0.1", 0))
+        dead = f"http://127.0.0.1:{s.getsockname()[1]}"
+    async with gateway_env(database_url, pool, dead, funded) as env:
+        status, _, _ = await chat(env.client, body())
+        assert status == 502
+        [hold] = await wait_closed(conn)
+    assert hold["state"] == "released"
+    assert await available(conn, env.team) == TEAM_GRANT
+    await assert_consistent(conn)
