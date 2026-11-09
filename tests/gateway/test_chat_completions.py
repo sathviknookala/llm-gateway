@@ -112,3 +112,61 @@ async def test_gateway_estimate_covers_the_mock_tokenizer():
     for content in ["", "a", "hello", "x" * 1000, "word " * 333]:
         msgs = [{"role": "system", "content": "be brief"}, {"role": "user", "content": content}]
         assert estimate_prompt_tokens(msgs) >= count_prompt_tokens(msgs)
+
+
+# --- refused before a hold ----------------------------------------------------
+
+
+@pytest.mark.parametrize("header", ["", "Bearer nope", "Basic abc"])
+async def test_rejects_missing_or_bad_key(conn, env, mock, header):
+    r = await env.client.post("/v1/chat/completions", json=body(), headers={"authorization": header})
+    assert r.status_code == 401
+    assert await holds(conn) == []
+    assert mock.state.requests == []
+
+
+async def test_rejects_revoked_key(conn, env, mock):
+    assert await auth.revoke_api_key(conn, env.key)
+    r = await env.client.post("/v1/chat/completions", json=body())
+    assert r.status_code == 401
+
+
+@pytest.mark.parametrize(
+    ("payload", "status", "code"),
+    [
+        ({**body(), "model": "gpt-nope"}, 404, "model_not_found"),
+        ({**body(), "stream": False}, 400, "stream_required"),
+        ({**body(), "messages": "hi"}, 400, "invalid_request"),
+        ({**body(), "max_tokens": 0}, 400, "invalid_request"),
+        ({**body(), "max_tokens": "10"}, 400, "invalid_request"),
+    ],
+)
+async def test_rejects_bad_requests(conn, env, mock, payload, status, code):
+    r = await env.client.post("/v1/chat/completions", json=payload)
+    assert r.status_code == status
+    assert r.json()["error"]["code"] == code
+    assert await holds(conn) == []
+
+
+async def test_invalid_json(conn, env):
+    r = await env.client.post("/v1/chat/completions", content=b"{not json")
+    assert r.status_code == 400
+
+
+async def test_insufficient_credits_is_402_and_nothing_is_sent(conn, env, mock):
+    r = await env.client.post("/v1/chat/completions", json=body(max_tokens=TEAM_GRANT))
+    assert r.status_code == 402
+    assert r.json()["error"]["code"] == "insufficient_credits"
+    assert await holds(conn) == []
+    assert mock.state.requests == []
+    assert await available(conn, env.team) == TEAM_GRANT
+
+
+async def test_at_capacity_is_429(conn, env, mock):
+    env.gw.inflight = env.gw.settings.max_inflight
+    try:
+        r = await env.client.post("/v1/chat/completions", json=body())
+    finally:
+        env.gw.inflight = 0
+    assert r.status_code == 429 and r.headers["retry-after"] == "1"
+    assert await holds(conn) == []
