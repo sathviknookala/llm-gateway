@@ -209,3 +209,50 @@ async def test_provider_unreachable_releases(conn, database_url, pool, funded):
     assert hold["state"] == "released"
     assert await available(conn, env.team) == TEAM_GRANT
     await assert_consistent(conn)
+
+
+# --- no usage block: settle on a flagged estimate -----------------------------
+
+
+async def test_upstream_cut_settles_flagged_estimate(conn, env, mock):
+    status, text, _ = await chat(env.client, body(cut_after=5))
+
+    assert status == 200  # headers went out before the cut
+    assert "tok4 " in text and "tok5 " not in text and "[DONE]" not in text
+    [hold] = await wait_closed(conn)
+    expected = cost(PRICE, PROMPT_EST, estimate_output_tokens(*tokens(5)))
+    assert hold["state"] == "settled"
+    assert hold["settled_amount"] == expected
+    assert (await close_posting(conn, hold))["flagged"]
+    assert await available(conn, env.team) == TEAM_GRANT - expected
+    await assert_consistent(conn)
+
+
+async def test_missing_usage_block_settles_flagged_estimate(conn, env, mock):
+    status, text, _ = await chat(env.client, body(no_usage=True))
+    assert status == 200 and "[DONE]" in text
+    [hold] = await wait_closed(conn)
+    assert hold["settled_amount"] == cost(PRICE, PROMPT_EST, estimate_output_tokens(*tokens(16)))
+    assert (await close_posting(conn, hold))["flagged"]
+
+
+async def test_usage_above_hold_is_capped_and_flagged(conn, env, mock):
+    status, _, _ = await chat(env.client, body(prompt_tokens=10_000))
+    assert status == 200
+    [hold] = await wait_closed(conn)
+    assert hold["settled_amount"] == hold["amount"]  # capped at the hold
+    assert (await close_posting(conn, hold))["flagged"]
+    assert await available(conn, env.team) == TEAM_GRANT - hold["amount"]
+    await assert_consistent(conn)
+
+
+async def test_upstream_timeout_settles_flagged_estimate(conn, database_url, pool, mock, funded):
+    async with gateway_env(
+        database_url, pool, mock.url, funded, upstream_timeout_s=0.3
+    ) as env:
+        status, text, _ = await chat(env.client, body(tokens=30, delay_ms=50))
+        assert status == 200 and "[DONE]" not in text
+        [hold] = await wait_closed(conn)
+    assert hold["state"] == "settled"
+    assert (await close_posting(conn, hold))["flagged"]
+    await assert_consistent(conn)
