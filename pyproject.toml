@@ -5,8 +5,13 @@ description = "LLM gateway with a double-entry credit ledger and a Postgres-back
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "anyio>=4.16.0",
     "asyncpg>=0.30",
+    "httpx>=0.28.1",
+    "orjson>=3.13.0",
+    "starlette>=1.10.0",
     "structlog>=24.4",
+    "uvicorn>=0.54.0",
 ]
 
 [project.scripts]
