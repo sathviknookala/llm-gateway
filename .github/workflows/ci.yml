@@ -26,6 +26,8 @@ jobs:
           POSTGRES_USER: llmgw
           POSTGRES_PASSWORD: llmgw
           POSTGRES_DB: llmgw
+        ports:
+          - 5432:5432
         options: >-
           --health-cmd "pg_isready -U llmgw -d llmgw"
           --health-interval 2s --health-timeout 3s --health-retries 20
