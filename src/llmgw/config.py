@@ -28,6 +28,9 @@ class Settings:
     settle_timeout_s: float = 5.0
     # Streams in flight per process; past it the gateway answers 429.
     max_inflight: int = 256
+    # Sweeper
+    sweep_interval_s: float = 5.0
+    sweep_batch: int = 500
 
     def __post_init__(self) -> None:
         if self.upstream_timeout_s + self.settle_timeout_s >= self.hold_ttl_s:
@@ -51,4 +54,6 @@ def load() -> Settings:
         upstream_timeout_s=float(env("LLMGW_UPSTREAM_TIMEOUT_S", "600")),
         settle_timeout_s=float(env("LLMGW_SETTLE_TIMEOUT_S", "5")),
         max_inflight=int(env("LLMGW_MAX_INFLIGHT", "256")),
+        sweep_interval_s=float(env("LLMGW_SWEEP_INTERVAL_S", "5")),
+        sweep_batch=int(env("LLMGW_SWEEP_BATCH", "500")),
     )

@@ -42,6 +42,10 @@ def main(argv: list[str] | None = None) -> int:
         print(asyncio.run(_create_key(args.team_id)))
         return 0
 
+    if args.mode == "sweeper":
+        asyncio.run(_sweep())
+        return 0
+
     print(f"llmgw: mode '{args.mode}' is not implemented yet", file=sys.stderr)
     return 2
 
@@ -57,6 +61,18 @@ async def _create_key(team_id: int) -> str:
             return await auth.create_api_key(conn, team_id)
     finally:
         await conn.close()
+
+
+async def _sweep() -> None:
+    from llmgw import config, sweeper
+    from llmgw.db import create_pool
+
+    settings = config.load()
+    pool = await create_pool(settings)
+    try:
+        await sweeper.run(pool, interval_s=settings.sweep_interval_s, batch=settings.sweep_batch)
+    finally:
+        await pool.close()
 
 
 if __name__ == "__main__":
