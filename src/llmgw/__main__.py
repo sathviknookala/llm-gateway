@@ -29,8 +29,9 @@ def main(argv: list[str] | None = None) -> int:
 
         from llmgw.mock_provider import create_app
 
+        tpm, rpm = os.environ.get("LLMGW_MOCK_TPM"), os.environ.get("LLMGW_MOCK_RPM")
         uvicorn.run(
-            create_app(),
+            create_app(tpm=int(tpm) if tpm else None, rpm=int(rpm) if rpm else None),
             host=os.environ.get("LLMGW_MOCK_HOST", "127.0.0.1"),
             port=int(os.environ.get("LLMGW_MOCK_PORT", "8100")),
         )

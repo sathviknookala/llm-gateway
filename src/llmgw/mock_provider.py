@@ -11,6 +11,13 @@ gateway forwards untouched:
     no_usage       finish normally but leave out the usage chunk
     prompt_tokens  report this prompt count instead of the mock's own count
 
+Provider limits (off unless set): `create_app(tpm=, rpm=)`, or
+LLMGW_MOCK_TPM / LLMGW_MOCK_RPM for `llmgw mock-provider`. Fixed 60 s windows.
+RPM counts each admitted request; TPM counts prompt + completion tokens when a
+stream ends, which is what the gateway refunds against. A request arriving
+when the window's RPM is used up, or its counted tokens already reach TPM, gets
+429 with `retry-after` = seconds to the window's end.
+
 The mock's tokenizer: ceil(chars / 4) per message plus 3, plus 3 per request.
 The gateway's estimate (llmgw.pricing) is built to stay at or above it.
 
@@ -45,6 +52,39 @@ class MockState:
     completed: int = 0
     cut: int = 0
     disconnected: int = 0
+    rate_limited: int = 0  # 429s from the mock's own TPM/RPM limits
+
+
+@dataclass
+class _Window:
+    """Fixed-window TPM/RPM counters, like a provider's per-minute limits."""
+
+    tpm: int | None
+    rpm: int | None
+    window_s: float
+    start: float = 0.0
+    requests: int = 0
+    tokens: int = 0
+
+    def _roll(self) -> float:
+        now = time.monotonic()
+        if now - self.start >= self.window_s:
+            self.start, self.requests, self.tokens = now, 0, 0
+        return now
+
+    def admit(self) -> float | None:
+        """Count a request; return seconds until the window resets if it's refused."""
+        now = self._roll()
+        if (self.rpm is not None and self.requests >= self.rpm) or (
+            self.tpm is not None and self.tokens >= self.tpm
+        ):
+            return self.start + self.window_s - now
+        self.requests += 1
+        return None
+
+    def used(self, tokens: int) -> None:
+        self._roll()
+        self.tokens += tokens
 
 
 def count_prompt_tokens(messages: list[dict[str, Any]]) -> int:
@@ -60,13 +100,21 @@ def _sse(obj: object) -> bytes:
     return b"data: " + orjson.dumps(obj) + b"\n\n"
 
 
-def create_app() -> Starlette:
+def create_app(*, tpm: int | None = None, rpm: int | None = None, window_s: float = 60.0) -> Starlette:
     state = MockState()
+    window = _Window(tpm, rpm, window_s)
 
     async def chat(request: Request) -> Response:
         body = await request.json()
         state.requests.append(body)
         sc: dict[str, Any] = body.get("mock") or {}
+
+        if (wait := window.admit()) is not None:
+            state.rate_limited += 1
+            return JSONResponse(
+                {"error": {"message": "mock rate limit", "type": "rate_limit"}},
+                status_code=429, headers={"retry-after": str(max(1, math.ceil(wait)))},
+            )
 
         if status := sc.get("status"):
             headers = {"retry-after": "1"} if status == 429 else None
@@ -88,6 +136,7 @@ def create_app() -> Starlette:
         cut_after = sc.get("cut_after")
 
         if not body.get("stream"):
+            window.used(prompt + n)
             text = "".join(f"tok{i} " for i in range(n))
             return JSONResponse({
                 "id": cid, "object": "chat.completion", "created": created, "model": model,
@@ -105,6 +154,7 @@ def create_app() -> Starlette:
             })
 
         async def events() -> AsyncIterator[bytes]:
+            sent = 0
             try:
                 yield chunk({"role": "assistant", "content": ""})
                 for i in range(n):
@@ -114,6 +164,7 @@ def create_app() -> Starlette:
                     if delay:
                         await asyncio.sleep(delay)
                     yield chunk({"content": f"tok{i} "})
+                    sent += 1
                 yield chunk({}, finish)
                 if include_usage and not sc.get("no_usage"):
                     yield _sse({
@@ -125,6 +176,8 @@ def create_app() -> Starlette:
             except asyncio.CancelledError:
                 state.disconnected += 1
                 raise
+            finally:
+                window.used(prompt + sent)
 
         return StreamingResponse(events(), media_type="text/event-stream")
 
