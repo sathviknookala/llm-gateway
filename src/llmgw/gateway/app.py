@@ -21,10 +21,18 @@ The endpoint is a raw ASGI app rather than a StreamingResponse so that it
 owns disconnect handling: a watcher task reads `receive()` and cancels the
 stream when the client leaves, whatever ASGI spec version the server speaks.
 Nothing network-shaped runs inside a ledger transaction.
+
+Rate limits (when `LLMGW_REDIS_URL` is set) run after validation and before
+the hold, so a refused request never touches the ledger. The TPM buckets are
+charged the same worst case that sizes the hold; once the call is over, the
+close task refunds the unused tokens. The refund follows what happened
+upstream (tokens the provider used), not whether the ledger write succeeded,
+and runs only if the acquire actually debited Redis.
 """
 
 import asyncio
 import contextlib
+import math
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -49,6 +57,7 @@ from llmgw.gateway.meter import StreamMeter
 from llmgw.ledger import holds
 from llmgw.ledger.errors import InsufficientCredits
 from llmgw.pricing import Price, cost, estimate_output_tokens, estimate_prompt_tokens
+from llmgw.ratelimit import RateLimiter
 
 log = structlog.get_logger("llmgw.gateway")
 
@@ -60,6 +69,7 @@ class Gateway:
     settings: Settings
     pool: asyncpg.Pool | None = None
     http: httpx.AsyncClient | None = None
+    limiter: RateLimiter | None = None
     inflight: int = 0
     # Test hook: awaited inside the shielded close, before the ledger write.
     before_close: Any = None
@@ -73,8 +83,12 @@ class _Call:
 
     hold_id: int
     request_id: str
+    team_id: int
+    model: str
     price: Price
     prompt_estimate: int
+    reserved_tokens: int  # charged to the TPM buckets at admission
+    debited: bool  # the rate-limit acquire debited Redis, so a refund is owed
     meter: StreamMeter = field(default_factory=StreamMeter)
     sent_upstream: bool = False
     refused: bool = False  # connect failure or upstream error status: release
@@ -137,6 +151,27 @@ class ChatCompletions:
         gw.inflight += 1
         try:
             prompt_estimate = estimate_prompt_tokens(body["messages"])
+            reserved_tokens = prompt_estimate + max_tokens
+            debited = False
+            if gw.limiter is not None:
+                if gw.limiter.oversized(team_id, model, reserved_tokens):
+                    return await _send_error(
+                        send, 400,
+                        f"request needs up to {reserved_tokens} tokens, more than a rate-limit bucket holds",
+                        "request_exceeds_rate_limit",
+                    )
+                decision = await gw.limiter.acquire(team_id, model, reserved_tokens)
+                if not decision.allowed:
+                    provider = "model" in decision.blocked
+                    retry = str(max(1, math.ceil(decision.wait_ms / 1000)))
+                    return await _send_error(
+                        send, 429,
+                        "provider budget exhausted" if provider else "team rate limit exceeded",
+                        "provider_budget_exhausted" if provider else "team_rate_limited",
+                        {"retry-after": retry},
+                    )
+                debited = decision.debited
+
             amount = max(1, cost(price, prompt_estimate, max_tokens))
             request_id = uuid.uuid4().hex
             try:
@@ -149,9 +184,14 @@ class ChatCompletions:
                         request_id=request_id,
                     )
             except InsufficientCredits:
+                await self._refund_tokens(team_id, model, reserved_tokens, debited)
                 return await _send_error(
                     send, 402, f"insufficient credits: this request holds {amount}", "insufficient_credits"
                 )
+            except BaseException:
+                # No hold, so no close task to refund later: give the tokens back now.
+                await self._refund_tokens(team_id, model, reserved_tokens, debited)
+                raise
 
             upstream_body = {
                 **body,
@@ -159,13 +199,13 @@ class ChatCompletions:
                 "stream": True,
                 "stream_options": {**(body.get("stream_options") or {}), "include_usage": True},
             }
-            call = _Call(hold.id, request_id, price, prompt_estimate)
+            call = _Call(hold.id, request_id, team_id, model, price, prompt_estimate, reserved_tokens, debited)
             try:
                 await self._proxy(call, upstream_body, receive, send)
             finally:
                 # Its own task, so even repeated Task.cancel() on this request
                 # can't stop the commit; the lifespan drains these on shutdown.
-                close = asyncio.ensure_future(self._close(call, team_id))
+                close = asyncio.ensure_future(self._close(call))
                 gw.closing.add(close)
                 close.add_done_callback(gw.closing.discard)
                 with anyio.CancelScope(shield=True):
@@ -256,20 +296,40 @@ class ChatCompletions:
             else:
                 await _send_error(send, status, message, code)
 
-    async def _close(self, call: _Call, team_id: int) -> None:
-        """Close the hold exactly once. Runs shielded; never raises."""
+    async def _refund_tokens(self, team_id: int, model: str, tokens: int, debited: bool) -> None:
+        """Give unused tokens back to the TPM buckets. Best effort, shielded, never raises."""
+        if not debited or tokens <= 0 or self.gw.limiter is None:
+            return
+        with anyio.CancelScope(shield=True):
+            await self.gw.limiter.refund(team_id, model, tokens)
+
+    async def _close(self, call: _Call) -> None:
+        """Close the hold exactly once, then refund unused tokens. Runs shielded; never raises."""
         meter = call.meter
         if call.refused:
             op, actual, flagged = "release", 0, False
+            used_tokens = 0
         elif meter.usage is not None:
             op, flagged = "settle", False
             actual = cost(call.price, meter.usage.prompt_tokens, meter.usage.completion_tokens)
+            used_tokens = meter.usage.prompt_tokens + meter.usage.completion_tokens
         else:
             op, flagged = "settle", True
             output = estimate_output_tokens(meter.content_chunks, meter.content_chars)
             actual = cost(call.price, call.prompt_estimate, output)
+            used_tokens = call.prompt_estimate + output if call.sent_upstream else 0
 
-        fields = dict(request_id=call.request_id, hold_id=call.hold_id, team_id=team_id,
+        try:
+            await self._close_hold(call, op, actual, flagged)
+        finally:
+            # Outside the close's timeout, with its own: tokens follow what the
+            # provider used, whether or not the ledger write went through.
+            await self._refund_tokens(
+                call.team_id, call.model, max(0, call.reserved_tokens - used_tokens), call.debited
+            )
+
+    async def _close_hold(self, call: _Call, op: str, actual: int, flagged: bool) -> None:
+        fields = dict(request_id=call.request_id, hold_id=call.hold_id, team_id=call.team_id,
                       op=op, actual=actual, flagged=flagged, client_gone=call.client_gone)
         try:
             with anyio.fail_after(self.gw.settings.settle_timeout_s):
@@ -303,8 +363,9 @@ def create_app(
     *,
     pool: asyncpg.Pool | None = None,
     http: httpx.AsyncClient | None = None,
+    limiter: RateLimiter | None = None,
 ) -> Starlette:
-    gw = Gateway(settings, pool=pool, http=http)
+    gw = Gateway(settings, pool=pool, http=http, limiter=limiter)
 
     @contextlib.asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
@@ -312,6 +373,11 @@ def create_app(
             if gw.pool is None:
                 gw.pool = await create_pool(settings)
                 stack.push_async_callback(gw.pool.close)
+            if gw.limiter is None and settings.redis_url:
+                gw.limiter = RateLimiter.from_url(
+                    settings.redis_url, settings.rate_limits, timeout_s=settings.redis_timeout_s
+                )
+                stack.push_async_callback(gw.limiter.aclose)
             if gw.http is None:
                 gw.http = httpx.AsyncClient(
                     timeout=httpx.Timeout(settings.upstream_timeout_s, connect=settings.upstream_connect_timeout_s),
@@ -322,7 +388,8 @@ def create_app(
                 yield
             finally:
                 if gw.closing:
-                    await asyncio.wait(gw.closing, timeout=settings.settle_timeout_s + 1)
+                    # A close is the ledger write plus a token refund, each with its own timeout.
+                    await asyncio.wait(gw.closing, timeout=settings.settle_timeout_s + settings.redis_timeout_s + 1)
 
     app = Starlette(
         routes=[
