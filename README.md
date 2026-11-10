@@ -1,6 +1,6 @@
 # llmgw
 
-LLM gateway with a double-entry credit ledger and a Postgres-backed job queue. The design is in [docs/design.md](docs/design.md).
+LLM gateway with a double-entry credit ledger and a Postgres-backed job queue.
 
 **Status:** milestones 1 and 2 implemented: the ledger (schema, API, concurrency tests, a Hypothesis state machine) and the synchronous path, an OpenAI-compatible streaming endpoint that holds credits up front and settles exact usage, tested against a deterministic mock provider.
 
@@ -53,10 +53,46 @@ Every request places a hold for its worst case (estimated prompt plus the output
 
 The close runs in its own task under a shielded cancel scope, so a cancelled request still settles. Tests cover each row, cancellation of the request task, and concurrent mixed traffic.
 
-To try it locally (with the database up and migrated):
+To try it locally, start the database and apply migrations, then start the mock provider:
 
 ```bash
+docker compose up -d postgres && docker compose run --rm flyway
 uv run llmgw mock-provider &
-uv run llmgw create-key --team-id 1
-uv run llmgw gateway
 ```
+
+There's no CLI for orgs and teams yet, so seed one through the ledger API. This prints the team id and an API key:
+
+```bash
+uv run python - <<'PY'
+import asyncio
+
+import asyncpg
+
+from llmgw import auth, config
+from llmgw.ledger import accounts, postings
+
+
+async def main():
+    conn = await asyncpg.connect(config.load().database_url)
+    async with conn.transaction():
+        org = await accounts.create_org(conn, "demo")
+        await postings.fund_org(conn, org_id=org.org_id, amount=10_000_000, idempotency_key="demo-fund")
+        team = await accounts.create_team(conn, org.org_id, "demo-team")
+        await postings.grant(conn, team_id=team.team_id, amount=1_000_000, idempotency_key="demo-grant")
+        print(f"team {team.team_id}: {await auth.create_api_key(conn, team.team_id)}")
+    await conn.close()
+
+
+asyncio.run(main())
+PY
+```
+
+Further keys for an existing team: `uv run llmgw create-key --team-id N`. Then start the gateway and stream a reply (the hold settles at the mock's reported usage):
+
+```bash
+uv run llmgw gateway &
+curl -N localhost:8000/v1/chat/completions -H "authorization: Bearer $KEY" \
+  -d '{"model": "mock-small", "messages": [{"role": "user", "content": "hello"}], "stream": true}'
+```
+
+Ports: gateway `LLMGW_PORT` (8000), mock `LLMGW_MOCK_PORT` (8100), and the gateway's upstream `LLMGW_UPSTREAM_URL` (`http://127.0.0.1:8100`). Settings are in `src/llmgw/config.py`.

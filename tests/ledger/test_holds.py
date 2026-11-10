@@ -33,8 +33,8 @@ async def balances(conn, org, team) -> dict[str, int]:
     }
 
 
-async def test_worked_example_from_design_doc(conn, tx, org, team):
-    """docs/design.md: pool funded 10,000, grant 1,000, hold 120, settle at 45."""
+async def test_worked_example(conn, tx, org, team):
+    """Worked example: pool funded 10,000, grant 1,000, hold 120, settle at 45."""
     hold = await place(tx, team, amount=120)
     assert await balances(conn, org, team) == {"pool": 9_000, "spend": 0, "available": 880, "held": 120}
 

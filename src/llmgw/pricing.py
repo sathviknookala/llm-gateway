@@ -3,7 +3,7 @@
 Estimates here are deliberately pessimistic. The prompt estimate sizes the
 hold, so it should come out at or above what the provider reports: an
 overshoot is refunded at settle, an undershoot is capped and left to
-reconciliation (see "Ledger implementation decisions" in docs/design.md).
+reconciliation.
 """
 
 import math

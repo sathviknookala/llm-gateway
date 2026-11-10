@@ -197,8 +197,8 @@ async def test_settled_amount_cannot_exceed_hold(conn, accts):
         )
 
 
-async def test_worked_example_from_design_doc(conn, accts):
-    """docs/design.md: fund 10,000, grant 1,000, hold 120, settle at 45."""
+async def test_worked_example(conn, accts):
+    """Worked example: fund 10,000, grant 1,000, hold 120, settle at 45."""
     await post(conn, accts.org_id, "fund", "fund-1", [(accts.external, -10_000), (accts.org_pool, 10_000)])
     await post(conn, accts.org_id, "grant", "grant-1", [(accts.org_pool, -1_000), (accts.team_available, 1_000)])
     await post(conn, accts.org_id, "hold", "hold-1", [(accts.team_available, -120), (accts.team_held, 120)])

@@ -18,7 +18,7 @@ async def make_team(tx, org, name: str, grant: int):
 
 
 async def test_two_holds_race_for_the_same_credits(conn, pool, tx, org):
-    """docs/design.md: 100 available, two calls worth 80 arrive together."""
+    """100 available, two calls worth 80 arrive together."""
     team = await make_team(tx, org, "B", 100)
     results = await asyncio.gather(
         *(
