@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass, field
 
 from llmgw.pricing import Price, load_prices
+from llmgw.ratelimit import RateLimits, parse_provider_limits
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,10 @@ class Settings:
     settle_timeout_s: float = 5.0
     # Streams in flight per process; past it the gateway answers 429.
     max_inflight: int = 256
+    # Rate limits (Redis). No redis_url → limiter off.
+    redis_url: str | None = None
+    redis_timeout_s: float = 0.25
+    rate_limits: RateLimits = field(default_factory=RateLimits)
     # Sweeper
     sweep_interval_s: float = 5.0
     sweep_batch: int = 500
@@ -35,6 +40,10 @@ class Settings:
     def __post_init__(self) -> None:
         if self.upstream_timeout_s + self.settle_timeout_s >= self.hold_ttl_s:
             raise ValueError("hold_ttl_s must exceed upstream_timeout_s + settle_timeout_s")
+
+
+def _opt_int(raw: str | None) -> int | None:
+    return int(raw) if raw else None
 
 
 def load() -> Settings:
@@ -54,6 +63,13 @@ def load() -> Settings:
         upstream_timeout_s=float(env("LLMGW_UPSTREAM_TIMEOUT_S", "600")),
         settle_timeout_s=float(env("LLMGW_SETTLE_TIMEOUT_S", "5")),
         max_inflight=int(env("LLMGW_MAX_INFLIGHT", "256")),
+        redis_url=env("LLMGW_REDIS_URL") or None,
+        redis_timeout_s=float(env("LLMGW_REDIS_TIMEOUT_S", "0.25")),
+        rate_limits=RateLimits(
+            team_tpm=_opt_int(env("LLMGW_TEAM_TPM")),
+            team_rpm=_opt_int(env("LLMGW_TEAM_RPM")),
+            provider=parse_provider_limits(env("LLMGW_PROVIDER_LIMITS")),
+        ),
         sweep_interval_s=float(env("LLMGW_SWEEP_INTERVAL_S", "5")),
         sweep_batch=int(env("LLMGW_SWEEP_BATCH", "500")),
     )
