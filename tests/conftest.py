@@ -1,5 +1,7 @@
 """Test database: one throwaway Postgres per session, migrations applied in
-version order with plain asyncpg (no Flyway), tables truncated per test."""
+version order with plain asyncpg (no Flyway), tables truncated per test.
+Redis: one throwaway redis:7 per session (started only by tests that use it),
+flushed per test."""
 
 import asyncio
 import re
@@ -7,7 +9,9 @@ from pathlib import Path
 
 import asyncpg
 import pytest
+import redis.asyncio as aioredis
 from testcontainers.community.postgres import PostgresContainer
+from testcontainers.community.redis import RedisContainer
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "db" / "migrations"
 TABLES = ("api_keys", "holds", "entries", "postings", "balances", "accounts", "teams", "orgs")
@@ -60,3 +64,20 @@ async def pool(database_url, conn):
         yield p
     finally:
         await p.close()
+
+
+@pytest.fixture(scope="session")
+def redis_url():
+    with RedisContainer("redis:7-alpine") as r:
+        yield f"redis://{r.get_container_host_ip()}:{r.get_exposed_port(6379)}/0"
+
+
+@pytest.fixture
+async def redis_client(redis_url):
+    """A client on an empty Redis."""
+    c = aioredis.from_url(redis_url)
+    await c.flushdb()
+    try:
+        yield c
+    finally:
+        await c.aclose()
