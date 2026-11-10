@@ -1,10 +1,11 @@
 # src/llmgw/gateway
-Responsibility: the synchronous path. Authenticate, place a hold, stream the provider's reply through, and close the hold exactly once on every exit path.
-Not responsible for: ledger rules (`llmgw/ledger`), prices and token estimates (`llmgw/pricing.py`), API keys (`llmgw/auth.py`), Redis rate limits (milestone 3), the hold-expiry sweeper.
+Responsibility: the synchronous path. Authenticate, check rate limits, place a hold, stream the provider's reply through, close the hold exactly once on every exit path, and refund unused rate-limit tokens.
+Not responsible for: ledger rules (`llmgw/ledger`), prices and token estimates (`llmgw/pricing.py`), API keys (`llmgw/auth.py`), bucket logic (`llmgw/ratelimit.py`), the hold-expiry sweeper (`llmgw/sweeper.py`).
 
 ## Contract
 - `POST /v1/chat/completions`, OpenAI-compatible, `stream: true` only. `GET /healthz`.
-- Errors before a hold: 401 bad key, 400 bad body or `stream` not true, 404 unknown model, 402 insufficient credits, 429 at `max_inflight`.
+- Errors before a hold, in this order: 401 bad key, 400 bad body or `stream` not true, 404 unknown model, 429 `capacity` at `max_inflight`, 400 `request_exceeds_rate_limit` (worst case bigger than a configured TPM bucket), 429 `team_rate_limited` / `provider_budget_exhausted` with `retry-after` (max wait over the blocking buckets; the model bucket names the code if both block), 402 insufficient credits.
+- Rate limits are on only when `settings.redis_url` is set. TPM buckets are charged `reserved_tokens` = prompt estimate + the forwarded cap, the same worst case the hold covers.
 - Upstream body: the client's body, plus `max_tokens` (or `max_completion_tokens` if the client used it) set to the cap the hold covers, and `stream_options.include_usage = true`.
 - How each hold closes:
   - **release**: connect failure, or the provider answered with an error status (429 → 429 with `retry-after`, other 4xx passed through, 5xx → 502).
@@ -12,6 +13,7 @@ Not responsible for: ledger rules (`llmgw/ledger`), prices and token estimates (
   - **settle on a flagged estimate**: anything else once the request was sent (client disconnect, upstream cut, timeout, no usage block). Prompt estimate plus counted output.
 
 ## Invariants
+- Token refunds: any failure between a debit and a placed hold (402 or any `place_hold` exception) refunds the whole reservation. After a hold, `_close` refunds `max(0, reserved − used)` after the ledger write, outside its timeout. `used` follows what happened upstream (release → 0, usage block → reported prompt + completion, otherwise prompt estimate + counted output), not whether the ledger write succeeded. No refund unless the acquire actually debited (`_Call.debited`); a failed-open acquire never refunds.
 - The close runs as its own task, awaited under `anyio.CancelScope(shield=True)` plus `asyncio.shield`. The shield covers anyio's level-triggered scope cancels; the separate task covers repeated `Task.cancel()`. Each has a test that fails without it. Don't simplify it to an `await` in `finally`.
 - `_close` never raises. A close that fails is logged and left to the sweeper.
 - Nothing network-shaped inside `transaction()`: hold, then stream, then close, each on its own.
@@ -30,4 +32,6 @@ Not responsible for: ledger rules (`llmgw/ledger`), prices and token estimates (
 - After the final body is sent, uvicorn's `receive()` returns `http.disconnect` too. `call.finished` keeps that from being logged as a client disconnect.
 - The client sees the end of the stream before the close commits. Tests poll with `wait_closed`.
 - `Gateway.before_close` is a test hook awaited inside the shielded close.
+- The shutdown drain waits `settle_timeout_s + redis_timeout_s + 1`: a close is the ledger write plus a refund, each with its own timeout.
+- The oversized check uses config only, so it still answers 400 when Redis is down.
 - `hold_ttl_s` must exceed `upstream_timeout_s + settle_timeout_s` (checked in `Settings`), or the sweeper could expire a hold whose stream is still running.

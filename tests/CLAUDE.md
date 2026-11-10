@@ -7,6 +7,7 @@ Not responsible for: the Flyway check (CI's `migrations` job does that), load or
   - `database_url` (session) — one Postgres 17 container per run; migrations applied in version order with plain asyncpg, no Flyway.
   - `conn` — a fresh connection with every table in `TABLES` truncated. Autocommit unless the test opens a transaction.
   - `pool` — up to 8 connections for concurrency tests; depends on `conn` so tables are truncated first.
+  - `redis_url` (session) — one redis:7 container, started only when a test asks for it; `redis_client` — a client on a flushed database.
 - `ledger/conftest.py` fixtures, built through the ledger API: `org` (pool funded with 10,000), `team` (team A granted 1,000), and `tx` (`await tx(fn, **kwargs)` runs one ledger call in its own transaction). `in_pool_tx` does the same on a pool connection for concurrency tests.
 
 ## Invariants
@@ -20,6 +21,10 @@ Not responsible for: the Flyway check (CI's `migrations` job does that), load or
 - `ledger/test_checks.py` — `check_ledger` finds corruption.
 - `ledger/test_concurrency.py` — races via `pool` and `asyncio.gather`.
 - `ledger/test_ledger_properties.py` — Hypothesis `RuleBasedStateMachine` over the ledger API, checked against a Python model of every balance.
+- `test_sweeper.py` — sweeper: expires overdue holds once, skips locked ones, survives a poisoned hold.
+- `test_ratelimit.py` — limiter against real Redis with explicit `now_ms`: refill, all-or-nothing, wait, refunds, script flush, fail-open.
+- `test_mock_provider.py` — the mock's own TPM/RPM limits.
+- `gateway/test_rate_limits.py` — rate limits end to end: 429s before the hold, refunds after the close, shared provider budget, fail-open, zero provider 429s under a lower gateway budget.
 - `gateway/test_chat_completions.py` — `/v1/chat/completions` end to end: usage settle, release on provider errors, flagged estimates on cut-offs and disconnects, cancellation of the request task, mixed concurrent traffic.
 - `gateway/conftest.py` — `mock` (mock provider on a real uvicorn server, `mock.state` records what it saw), `funded` (org, team A granted 1,000,000, API key), `env` (gateway on uvicorn plus an authenticated httpx client), and `gateway_env(...)` for settings overrides.
 
@@ -36,3 +41,5 @@ Not responsible for: the Flyway check (CI's `migrations` job does that), load or
 - The first test in a run is slow: it starts the container and applies migrations.
 - Gateway tests run uvicorn via `server._serve(sockets=...)` to skip its signal-handler capture.
 - The gateway closes a hold after the client has seen the end of the stream, so poll with `wait_closed` before asserting on holds or balances.
+- The token refund lands after the hold close commits; poll the bucket (`wait_level`) rather than relying on `wait_closed`.
+- Limiter tests pass `now_ms` so refill is deterministic; gateway tests use limits whose refill over a test (e.g. TPM 600 → 10 tokens/s) is far below one request.

@@ -1,25 +1,27 @@
 # llmgw
 LLM gateway with a double-entry credit ledger and a Postgres-backed job queue.
-Milestones 1 (ledger) and 2 (synchronous path against the mock provider) are done.
+Milestones 1 (ledger), 2 (synchronous path against the mock provider) and 3 (Redis rate limits and the shared provider budget, plus the hold-expiry sweeper) are done.
 
 ## Commands
 - Install: `uv sync`
-- Test: `uv run pytest` (needs Docker; testcontainers starts a throwaway Postgres 17)
+- Test: `uv run pytest` (needs Docker; testcontainers starts a throwaway Postgres 17, and redis:7 for tests that use it)
 - One file: `uv run pytest tests/ledger/test_db_invariants.py`
-- Local DB with migrations: `docker compose up -d postgres && docker compose run --rm flyway`
-- Run locally: `uv run llmgw mock-provider` (port 8100), then `uv run llmgw gateway` (port 8000). No CLI creates orgs or teams yet; seed one with the snippet in README.md, and `uv run llmgw create-key --team-id N` adds keys to an existing team
+- Local DB with migrations: `docker compose up -d postgres && docker compose run --rm flyway`; Redis: `docker compose up -d redis`
+- Run locally: `uv run llmgw mock-provider` (port 8100), then `uv run llmgw gateway` (port 8000), and `uv run llmgw sweeper`. Rate limits are on only when `LLMGW_REDIS_URL` is set. No CLI creates orgs or teams yet; seed one with the snippet in README.md, and `uv run llmgw create-key --team-id N` adds keys to an existing team
 - Definition of done: `uv run pytest` passes, and migrations still pass Flyway `migrate validate` (CI `migrations` job)
 
 ## Map
 - `db/migrations/` — Flyway SQL; source of truth for schema and ledger invariants (see its CLAUDE.md)
 - `src/llmgw/ledger/` — accounts, idempotent postings, the hold lifecycle, and `check_ledger` (see its CLAUDE.md)
 - `src/llmgw/gateway/` — `/v1/chat/completions`: hold, stream through, close the hold exactly once (see its CLAUDE.md)
+- `src/llmgw/ratelimit.py` — Redis token buckets (team TPM/RPM, per-model provider budget), one all-or-nothing Lua script; fails open
+- `src/llmgw/sweeper.py` — expires overdue holds, one per transaction, `FOR UPDATE SKIP LOCKED`
 - `src/llmgw/pricing.py` — price table (micro-credits per token) and pessimistic token estimates
 - `src/llmgw/auth.py` — team API keys, stored as SHA-256 hashes
-- `src/llmgw/mock_provider.py` — deterministic OpenAI-compatible provider; fault scenarios via a `mock` body field
+- `src/llmgw/mock_provider.py` — deterministic OpenAI-compatible provider; fault scenarios via a `mock` body field; optional fixed-window TPM/RPM limits
 - `src/llmgw/db.py` — asyncpg pool, `transaction()` helper, `require_transaction()`
 - `src/llmgw/config.py` — settings from `LLMGW_*` env vars
-- `src/llmgw/__main__.py` — CLI modes: gateway, mock-provider, create-key; worker, sweeper, reconciler not implemented
+- `src/llmgw/__main__.py` — CLI modes: gateway, mock-provider, create-key, sweeper; worker, reconciler not implemented
 - `tests/` — `conftest.py` applies migrations with plain asyncpg (no Flyway) and truncates tables per test (see its CLAUDE.md)
 
 ## Hard rules

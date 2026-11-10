@@ -1,5 +1,5 @@
-# Local dev. M1 needs Postgres only; Redis, the gateway, workers and the mock
-# provider are added in later milestones.
+# Local dev: Postgres (ledger) and Redis (rate limits). The gateway, sweeper
+# and mock provider run from `uv run llmgw <mode>`.
 services:
   postgres:
     image: postgres:17-alpine
@@ -13,6 +13,17 @@ services:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U llmgw -d llmgw"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  # Rate limits. Pinned to 7: the limiter's Lua scripts read TIME before writing.
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 2s
       timeout: 3s
       retries: 20
