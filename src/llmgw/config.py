@@ -1,6 +1,7 @@
 """Settings read from the environment."""
 
 import os
+import socket
 from dataclasses import dataclass, field
 
 from llmgw.pricing import Price, load_prices
@@ -36,10 +37,41 @@ class Settings:
     # Sweeper
     sweep_interval_s: float = 5.0
     sweep_batch: int = 500
+    # Job queue
+    job_max_attempts: int = 5
+    # A job not finished by its deadline is dead-lettered and its hold released.
+    job_ttl_s: float = 86_400.0
+    job_lease_s: float = 30.0
+    job_heartbeat_s: float = 10.0
+    # Backoff before retry n: uniform(0, min(cap, base * 2**(n-1))), at least retry-after.
+    job_retry_base_s: float = 1.0
+    job_retry_cap_s: float = 60.0
+    worker_concurrency: int = 8
+    worker_poll_s: float = 1.0
+    worker_id: str = field(default_factory=lambda: f"{socket.gethostname()}:{os.getpid()}")
 
     def __post_init__(self) -> None:
         if self.upstream_timeout_s + self.settle_timeout_s >= self.hold_ttl_s:
             raise ValueError("hold_ttl_s must exceed upstream_timeout_s + settle_timeout_s")
+        positive = (
+            self.job_max_attempts, self.job_ttl_s, self.job_lease_s, self.job_heartbeat_s,
+            self.worker_concurrency, self.worker_poll_s,
+        )
+        if any(x <= 0 for x in positive):
+            raise ValueError("job and worker settings must be positive")
+        if self.job_retry_base_s < 0 or self.job_retry_cap_s < self.job_retry_base_s:
+            raise ValueError("job_retry_cap_s must be at least job_retry_base_s, both non-negative")
+        if self.job_heartbeat_s * 2 > self.job_lease_s:
+            raise ValueError("job_heartbeat_s must be at most half of job_lease_s")
+
+    @property
+    def job_hold_grace_s(self) -> float:
+        """How long a job's hold outlives its deadline: one last attempt plus its finish.
+
+        The hold sweeper skips job holds, so this only bounds the hold on paper;
+        the job paths (finish, reclaim, deadline) are what close it.
+        """
+        return self.upstream_timeout_s + self.settle_timeout_s + self.job_lease_s + 60.0
 
 
 def _opt_int(raw: str | None) -> int | None:
@@ -72,4 +104,13 @@ def load() -> Settings:
         ),
         sweep_interval_s=float(env("LLMGW_SWEEP_INTERVAL_S", "5")),
         sweep_batch=int(env("LLMGW_SWEEP_BATCH", "500")),
+        job_max_attempts=int(env("LLMGW_JOB_MAX_ATTEMPTS", "5")),
+        job_ttl_s=float(env("LLMGW_JOB_TTL_S", "86400")),
+        job_lease_s=float(env("LLMGW_JOB_LEASE_S", "30")),
+        job_heartbeat_s=float(env("LLMGW_JOB_HEARTBEAT_S", "10")),
+        job_retry_base_s=float(env("LLMGW_JOB_RETRY_BASE_S", "1")),
+        job_retry_cap_s=float(env("LLMGW_JOB_RETRY_CAP_S", "60")),
+        worker_concurrency=int(env("LLMGW_WORKER_CONCURRENCY", "8")),
+        worker_poll_s=float(env("LLMGW_WORKER_POLL_S", "1")),
+        worker_id=env("LLMGW_WORKER_ID") or f"{socket.gethostname()}:{os.getpid()}",
     )
