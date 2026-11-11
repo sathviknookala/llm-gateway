@@ -1,6 +1,7 @@
 """Synchronous path: authenticate, hold, stream through, settle.
 
 POST /v1/chat/completions (OpenAI-compatible, `stream: true` only for now).
+The job routes (POST /v1/jobs, GET /v1/jobs/{id}) live in `gateway/jobs.py`.
 
 Every hold placed here is closed exactly once, on every exit path:
 
@@ -53,10 +54,12 @@ from starlette.types import Receive, Scope, Send
 from llmgw import auth
 from llmgw.config import Settings
 from llmgw.db import create_pool, transaction
+from llmgw.gateway import jobs
 from llmgw.gateway.meter import StreamMeter
 from llmgw.ledger import holds
 from llmgw.ledger.errors import InsufficientCredits
-from llmgw.pricing import Price, cost, estimate_output_tokens, estimate_prompt_tokens
+from llmgw.gateway.request import Refusal, parse_chat
+from llmgw.pricing import Price, cost, estimate_output_tokens
 from llmgw.ratelimit import RateLimiter
 
 log = structlog.get_logger("llmgw.gateway")
@@ -125,33 +128,19 @@ class ChatCompletions:
         if team_id is None:
             return await _send_error(send, 401, "invalid API key", "invalid_api_key")
 
-        try:
-            body = orjson.loads(await request.body())
-        except orjson.JSONDecodeError:
-            return await _send_error(send, 400, "body is not valid JSON", "invalid_json")
-        if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
-            return await _send_error(send, 400, "`messages` must be a list", "invalid_request")
-        if body.get("stream") is not True:
-            return await _send_error(send, 400, "only `stream: true` is supported", "stream_required")
-        model = body.get("model")
-        price = settings.prices.get(model) if isinstance(model, str) else None
-        if price is None:
-            return await _send_error(send, 404, f"unknown model {model!r}", "model_not_found")
-
-        cap_field = "max_completion_tokens" if "max_completion_tokens" in body else "max_tokens"
-        max_tokens = body.get(cap_field)
-        if max_tokens is None:
-            max_tokens = settings.default_max_tokens
-        if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
-            return await _send_error(send, 400, f"`{cap_field}` must be a positive integer", "invalid_request")
+        parsed = parse_chat(await request.body(), settings, stream=True)
+        if isinstance(parsed, Refusal):
+            return await _send_error(send, parsed.status, parsed.message, parsed.code)
+        body, model, price = parsed.body, parsed.model, parsed.price
+        cap_field, max_tokens = parsed.cap_field, parsed.max_tokens
 
         if gw.inflight >= settings.max_inflight:
             return await _send_error(send, 429, "gateway at capacity", "capacity", {"retry-after": "1"})
 
         gw.inflight += 1
         try:
-            prompt_estimate = estimate_prompt_tokens(body["messages"])
-            reserved_tokens = prompt_estimate + max_tokens
+            prompt_estimate = parsed.prompt_estimate
+            reserved_tokens = parsed.reserved_tokens
             debited = False
             if gw.limiter is not None:
                 if gw.limiter.oversized(team_id, model, reserved_tokens):
@@ -394,6 +383,8 @@ def create_app(
     app = Starlette(
         routes=[
             Route("/v1/chat/completions", ChatCompletions(gw), methods=["POST"]),
+            Route("/v1/jobs", jobs.submit, methods=["POST"]),
+            Route("/v1/jobs/{job_id:int}", jobs.get, methods=["GET"]),
             Route("/healthz", _healthz),
         ],
         lifespan=lifespan,
