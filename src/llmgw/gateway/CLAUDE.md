@@ -1,9 +1,11 @@
 # src/llmgw/gateway
-Responsibility: the synchronous path. Authenticate, check rate limits, place a hold, stream the provider's reply through, close the hold exactly once on every exit path, and refund unused rate-limit tokens.
-Not responsible for: ledger rules (`llmgw/ledger`), prices and token estimates (`llmgw/pricing.py`), API keys (`llmgw/auth.py`), bucket logic (`llmgw/ratelimit.py`), the hold-expiry sweeper (`llmgw/sweeper.py`).
+Responsibility: the synchronous path, and the HTTP side of jobs (submit and poll). Authenticate, check rate limits, place a hold, stream the provider's reply through, close the hold exactly once on every exit path, and refund unused rate-limit tokens.
+Not responsible for: ledger rules (`llmgw/ledger`), prices and token estimates (`llmgw/pricing.py`), API keys (`llmgw/auth.py`), bucket logic (`llmgw/ratelimit.py`), the hold-expiry sweeper (`llmgw/sweeper.py`), running jobs (`llmgw/jobs`).
 
 ## Contract
 - `POST /v1/chat/completions`, OpenAI-compatible, `stream: true` only. `GET /healthz`.
+- `POST /v1/jobs`: 401, then the shared body checks (`stream` must be absent or false → else 400 `stream_not_supported`; `n` must be 1), 400 bad `Idempotency-Key`, 400 `request_exceeds_rate_limit`, then `enqueue` in one transaction → 202 (200 for an idempotent replay), 402 `insufficient_credits`, 409 `idempotency_conflict`. No inflight slot or rate-limit acquire at enqueue. The stored request is the body with the cap field set and `stream`/`stream_options` removed.
+- `GET /v1/jobs/{id}`: the job (state, attempts, `last_error`, `result`); 404 `job_not_found` for a missing job or another team's.
 - Errors before a hold, in this order: 401 bad key, 400 bad body or `stream` not true, 404 unknown model, 429 `capacity` at `max_inflight`, 400 `request_exceeds_rate_limit` (worst case bigger than a configured TPM bucket), 429 `team_rate_limited` / `provider_budget_exhausted` with `retry-after` (max wait over the blocking buckets; the model bucket names the code if both block), 402 insufficient credits.
 - Rate limits are on only when `settings.redis_url` is set. TPM buckets are charged `reserved_tokens` = prompt estimate + the forwarded cap, the same worst case the hold covers.
 - Upstream body: the client's body, plus `max_tokens` (or `max_completion_tokens` if the client used it) set to the cap the hold covers, and `stream_options.include_usage = true`.
@@ -21,7 +23,9 @@ Not responsible for: ledger rules (`llmgw/ledger`), prices and token estimates (
 
 ## Entry points
 - `app.py`: `create_app(settings, pool=, http=)`, `ChatCompletions` (raw ASGI app), `Gateway` (shared state: pool, http client, in-flight count, pending closes).
-- `meter.py`: `StreamMeter`, an incremental SSE parser that counts content chunks and chars and keeps the usage block.
+- `meter.py`: `StreamMeter`, an incremental SSE parser that counts content chunks and chars and keeps the usage block and finish_reason; with `collect=True` it also rebuilds a `chat.completion` (`result()`).
+- `request.py`: `parse_chat(raw, settings, stream=)`, the body checks both paths share, in the order of the error list above.
+- `jobs.py`: the job routes.
 
 ## Testing here
 - `uv run pytest tests/gateway`. The mock provider and the gateway each run on a real uvicorn server, so disconnects are real socket closes.

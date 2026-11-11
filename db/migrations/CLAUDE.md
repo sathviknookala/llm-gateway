@@ -1,17 +1,17 @@
 # db/migrations
-Responsibility: the ledger schema and every invariant the database enforces (triggers, CHECKs, unique indexes), plus gateway tables (`api_keys`).
+Responsibility: the ledger schema and every invariant the database enforces (triggers, CHECKs, unique indexes), plus gateway and queue tables (`api_keys`, `jobs`, `job_attempts`).
 Not responsible for: ledger operations or mapping DB errors to Python errors (that's `src/llmgw/ledger/`).
 
 ## Contract
 - Files are `V{n}__snake_case.sql`, applied in numeric order by Flyway (docker compose, CI) and by `tests/conftest.py` with plain asyncpg.
 - Plain SQL only: no `${placeholders}`, no callbacks. Only `V` files are picked up by conftest, so no `R__` repeatable migrations.
 - Names and messages other code depends on: tests assert the `balance_non_negative` constraint name, the `unbalanced` / `append-only` messages, and the `check_violation` / `restrict_violation` error codes; `llmgw.ledger` maps `balance_non_negative` to `InsufficientCredits`. Renaming any of them needs matching changes there.
-- Postgres enums (`account_kind`, `posting_kind`, `hold_state`) mirror the `StrEnum`s in `src/llmgw/ledger/models.py`; change both together.
+- Postgres enums (`account_kind`, `posting_kind`, `hold_state`) mirror the `StrEnum`s in `src/llmgw/ledger/models.py`; `job_state` and `attempt_outcome` mirror `JobState` and `Outcome` in `src/llmgw/jobs/queue.py`. Change both together.
 
 ## Invariants
 - Never edit or rename a migration once written; fix forward with the next `V{n}`.
 - Amounts are `bigint` micro-credits.
-- `entries` and `postings` are append-only; corrections are new postings. `holds` is the only ledger table updated in place, and its CHECKs keep state, `close_posting_id`, `closed_at` and `settled_amount` consistent.
+- `entries` and `postings` are append-only; corrections are new postings. `holds` is the only ledger table updated in place, and its CHECKs keep state, `close_posting_id`, `closed_at` and `settled_amount` consistent. `jobs` is updated in place (CHECKs tie `locked_until` to `running`, `result` to `succeeded`, `finished_at` to the terminal states); `job_attempts` rows are written once, except `lost` → `fenced`.
 - A new account kind is non-negative by default (`ledger_create_balance` sets `non_negative = kind <> 'external'`); decide explicitly if it may go negative.
 - Every new invariant gets a raw-SQL test in `tests/ledger/test_db_invariants.py`.
 
@@ -19,6 +19,7 @@ Not responsible for: ledger operations or mapping DB errors to Python errors (th
 - `V1__ledger_tables.sql` — tables, enums, indexes, CHECKs.
 - `V2__ledger_invariants.sql` — triggers: balance row per account, balances moved by entries, deferred sum-zero check, append-only guard.
 - `V3__api_keys.sql` — team API keys: SHA-256 hash (32 bytes, unique), display prefix, `revoked_at`.
+- `V4__jobs.sql` — `retry_loss` posting kind; `jobs` (one hold each, unique per team + idempotency key, `lease_token` fencing) and `job_attempts` (one row per finished attempt, PK `(job_id, attempt)`, at most one retry-loss posting each).
 
 ## Testing here
 - `uv run pytest tests/ledger/test_db_invariants.py` — applies all migrations to a fresh Postgres 17.
@@ -30,4 +31,4 @@ Not responsible for: ledger operations or mapping DB errors to Python errors (th
 - New tables must be added to `TABLES` in `tests/conftest.py`, or rows leak between tests.
 - Tests reset with `TRUNCATE`, which skips the row-level append-only triggers. A statement-level `TRUNCATE` trigger would break the test reset.
 - The sum-zero trigger fires from both `postings` and `entries` inserts, so a posting with no entries also fails at COMMIT.
-- `posting_kind` has no value for retry-loss postings yet; the `retry_loss` account exists but nothing posts to it.
+- `V4` adds `posting_kind` value `retry_loss` and never uses it in that file (it can't, in the same transaction).

@@ -1,5 +1,5 @@
 # src/llmgw/ledger
-Responsibility: the Python API over the ledger: orgs and teams with their accounts, idempotent postings (fund, grant), the hold lifecycle (place, then exactly one of settle, release, expire), and the whole-ledger consistency check.
+Responsibility: the Python API over the ledger: orgs and teams with their accounts, idempotent postings (fund, grant, retry loss), the hold lifecycle (place, then exactly one of settle, release, expire), and the whole-ledger consistency check.
 Not responsible for: enforcing invariants (the database does, in `db/migrations/`), pools and transactions (`llmgw/db.py`), provider calls or rate limits.
 
 ## Contract
@@ -10,10 +10,11 @@ Not responsible for: enforcing invariants (the database does, in `db/migrations/
 
 ## Invariants
 - Idempotency: same key + same `request_hash` → return the existing posting, write nothing. Same key + different hash → `IdempotencyConflict`. `request_hash` covers the operation's inputs (canonical JSON: op plus its arguments), not its entries, because the inputs are what a retry repeats. `place_hold` leaves `expires_at` out of it, since a retry recomputes it.
-- Keys: fund and grant take a caller key. `place_hold` builds `hold:{request_id}`. Closes build `settle:{hold_id}`, `release:{hold_id}`, `expire:{hold_id}`; callers never pass close keys.
+- Keys: fund and grant take a caller key. `post_retry_loss` builds `retry_loss:{job_id}:{attempt}`. `place_hold` builds `hold:{request_id}`. Closes build `settle:{hold_id}`, `release:{hold_id}`, `expire:{hold_id}`; callers never pass close keys.
 - Lock order: the hold row (`FOR UPDATE`) first, then balance rows, which the entry inserts lock in `account_id` order. Insert a posting's entries in `account_id` order.
 - Close order: lock hold → replay check on its own key → require state `held` (else `InvalidHoldState`, no posting) → post → `UPDATE holds ... WHERE id = $1 AND state = 'held'`.
 - Settle charges `min(actual, amount)`: team_held −amount, provider_spend +charged, team_available +(amount − charged). `actual > amount` charges the full hold, flags the posting, and reports `uncovered`; reconciliation books the rest. A settle on an expired hold raises `InvalidHoldState`; that cost is also left to reconciliation.
+- Retry loss: org `external` −amount, org `retry_loss` +amount. External is the counterparty so the posting can't fail on an empty pool; org spend to reconcile is provider_spend + retry_loss.
 - Python checks arguments only (positive amounts, `actual >= 0`). Overdrafts, sum-zero and append-only are the database's job; don't re-check them here.
 - SQL only. No network calls, no retries, no sleeps.
 
@@ -21,7 +22,8 @@ Not responsible for: enforcing invariants (the database does, in `db/migrations/
 - `accounts.py` — `create_org`, `create_team`, `org_accounts`, `team_accounts`, `balance`, `team_summary`.
 - `postings.py` — `post`, `request_hash`, `find_posting`, `check_replay`, `fund_org`, `grant`.
 - `holds.py` — `place_hold`, `settle`, `release`, `expire`, `get_hold`.
-- `checks.py` — `check_ledger`: returns a list of violations, empty when consistent.
+- `losses.py` — `post_retry_loss`.
+- `checks.py` — `check_ledger`: returns a list of violations, empty when consistent. Includes the queue's links: each retry_loss posting has a `job_attempts` row, and each job's hold state matches the job (`queued`/`running` → held, `succeeded` → settled, `failed`/`dead` → released).
 - `models.py` — value types and enums; `errors.py` — ledger exceptions.
 
 ## Testing here

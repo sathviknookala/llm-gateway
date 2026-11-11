@@ -1,5 +1,5 @@
-# Local dev: Postgres (ledger) and Redis (rate limits). The gateway, sweeper
-# and mock provider run from `uv run llmgw <mode>`.
+# Local dev: Postgres (ledger and job queue) and Redis (rate limits). The
+# gateway, worker, sweeper and mock provider run from `uv run llmgw <mode>`.
 services:
   postgres:
     image: postgres:17-alpine

@@ -1,5 +1,5 @@
 # tests
-Responsibility: proving the ledger can't lose or invent credits — schema invariants, ledger operations, concurrency, and property tests — and that the gateway closes every hold exactly once.
+Responsibility: proving the ledger can't lose or invent credits — schema invariants, ledger operations, concurrency, and property tests — and that the gateway closes every hold exactly once and the job queue runs and charges each job once.
 Not responsible for: the Flyway check (CI's `migrations` job does that), load or fault tests (later milestones).
 
 ## Contract
@@ -22,8 +22,15 @@ Not responsible for: the Flyway check (CI's `migrations` job does that), load or
 - `ledger/test_concurrency.py` — races via `pool` and `asyncio.gather`.
 - `ledger/test_ledger_properties.py` — Hypothesis `RuleBasedStateMachine` over the ledger API, checked against a Python model of every balance.
 - `test_sweeper.py` — sweeper: expires overdue holds once, skips locked ones, survives a poisoned hold.
+- `jobs/test_queue.py` — queue operations against Postgres: atomic enqueue, idempotency (sequential and concurrent), FIFO and SKIP LOCKED leases, fencing, finish replays, retries, dead letters, attempt-number reuse.
+- `jobs/test_sweeper_jobs.py` — lease reclaim, deadlines, concurrent reclaims, the hold sweeper skipping job holds, lost → fenced.
+- `jobs/test_worker.py` — the worker end to end against the mock: success, missing usage, 503/cut then success, 429 retry-after, 400, dead letters, lost lease mid-stream, crash before the finish, repeated cancellation, shutdown drain, rate limits, concurrent workers.
+- `jobs/conftest.py` — `team` (granted 100,000), `enqueue` / `fail` / `complete` helpers (each in its own transaction), `expire_lease`, `make_due`, `NO_BACKOFF`, `mock`, `worker`, and `worker_env(...)` for settings or a limiter.
+- `gateway/test_jobs_api.py` — `POST /v1/jobs` and `GET /v1/jobs/{id}`.
+- `gateway/test_meter.py` — `StreamMeter` counting and result capture.
+- `test_config.py` — settings guards.
 - `test_ratelimit.py` — limiter against real Redis with explicit `now_ms`: refill, all-or-nothing, wait, refunds, script flush, fail-open.
-- `test_mock_provider.py` — the mock's own TPM/RPM limits.
+- `test_mock_provider.py` — the mock's own TPM/RPM limits and per-key attempt scripts.
 - `gateway/test_rate_limits.py` — rate limits end to end: 429s before the hold, refunds after the close, shared provider budget, fail-open, zero provider 429s under a lower gateway budget.
 - `gateway/test_chat_completions.py` — `/v1/chat/completions` end to end: usage settle, release on provider errors, flagged estimates on cut-offs and disconnects, cancellation of the request task, mixed concurrent traffic.
 - `gateway/conftest.py` — `mock` (mock provider on a real uvicorn server, `mock.state` records what it saw), `funded` (org, team A granted 1,000,000, API key), `env` (gateway on uvicorn plus an authenticated httpx client), and `gateway_env(...)` for settings overrides.
@@ -42,4 +49,6 @@ Not responsible for: the Flyway check (CI's `migrations` job does that), load or
 - Gateway tests run uvicorn via `server._serve(sockets=...)` to skip its signal-handler capture.
 - The gateway closes a hold after the client has seen the end of the stream, so poll with `wait_closed` before asserting on holds or balances.
 - The token refund lands after the hold close commits; poll the bucket (`wait_level`) rather than relying on `wait_closed`.
+- Worker tests step with `run_one()` and make jobs due with SQL; a lost lease is simulated by bumping `lease_token` once the mock's `sent_chunks` shows the stream is under way.
+- `tests/` has no `__init__.py`, so `jobs/conftest.py` imports `gateway.conftest` (the rootdir-relative package name) for `serve` and `make_settings`.
 - Limiter tests pass `now_ms` so refill is deterministic; gateway tests use limits whose refill over a test (e.g. TPM 600 → 10 tokens/s) is far below one request.
