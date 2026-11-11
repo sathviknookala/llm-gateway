@@ -1,4 +1,4 @@
-"""The mock provider's own TPM/RPM limits."""
+"""The mock provider: its own TPM/RPM limits and per-key attempt scripts."""
 
 import asyncio
 
@@ -57,3 +57,27 @@ async def test_no_limits_by_default():
     async with client(app) as c:
         for _ in range(20):
             assert (await stream(c)).status_code == 200
+
+
+def scripted(key: str) -> dict:
+    b = body()
+    b["mock"] = {"tokens": 4, "key": key, "script": [{"status": 503}, {"tokens": 2}, {}]}
+    return b
+
+
+async def test_script_steps_per_key_and_repeats_the_last_step():
+    app = mock_provider.create_app()
+    async with client(app) as c:
+        async def send(key):
+            r = await c.post("/v1/chat/completions", content=orjson.dumps(scripted(key)))
+            await r.aread()
+            return r
+
+        assert (await send("a")).status_code == 503
+        second = await send("a")
+        assert second.status_code == 200 and second.text.count('"content":"tok') == 2
+        assert (await send("a")).text.count('"content":"tok') == 4  # last step {} keeps the top-level tokens
+        assert (await send("a")).text.count('"content":"tok') == 4
+        assert (await send("b")).status_code == 503  # a new key starts at step 0
+    assert app.state.mock.script_calls == {"a": 4, "b": 1}
+    assert app.state.mock.sent_chunks == 2 + 4 + 4
