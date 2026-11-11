@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import contextlib
 import os
 import sys
 
@@ -45,6 +46,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.mode == "sweeper":
         asyncio.run(_sweep())
+        return 0
+
+    if args.mode == "worker":
+        from llmgw import config
+        from llmgw.jobs import worker
+
+        with contextlib.suppress(KeyboardInterrupt):
+            asyncio.run(worker.serve(config.load()))
         return 0
 
     print(f"llmgw: mode '{args.mode}' is not implemented yet", file=sys.stderr)
