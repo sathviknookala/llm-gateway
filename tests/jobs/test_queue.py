@@ -143,6 +143,17 @@ async def test_concurrent_leases_take_distinct_jobs(conn, pool, team):
     assert len(leased) == len(set(leased)) == 5
 
 
+async def test_lease_skips_a_locked_row_instead_of_waiting(conn, pool, team):
+    first, _ = await enqueue(conn, team)
+    second, _ = await enqueue(conn, team)
+    async with pool.acquire() as other:
+        async with other.transaction():
+            await other.execute("SELECT 1 FROM jobs WHERE id = $1 FOR UPDATE", first.id)
+            async with asyncio.timeout(2):
+                got = await queue.lease(pool, **LEASE)
+    assert got.id == second.id
+
+
 async def test_renew_with_a_stale_token_is_lease_lost(conn, team):
     await enqueue(conn, team)
     j = await queue.lease(conn, **LEASE)
