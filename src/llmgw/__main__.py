@@ -71,7 +71,10 @@ async def _sweep() -> None:
     settings = config.load()
     pool = await create_pool(settings)
     try:
-        await sweeper.run(pool, interval_s=settings.sweep_interval_s, batch=settings.sweep_batch)
+        await sweeper.run(
+            pool, interval_s=settings.sweep_interval_s, batch=settings.sweep_batch,
+            retry_base_s=settings.job_retry_base_s, retry_cap_s=settings.job_retry_cap_s,
+        )
     finally:
         await pool.close()
 
