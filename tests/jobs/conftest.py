@@ -66,3 +66,36 @@ async def expire_lease(c, job_id):
 
 async def make_due(c, job_id):
     await c.execute("UPDATE jobs SET run_after = now() WHERE id = $1", job_id)
+
+
+# --- worker fixtures: the mock provider on a real uvicorn server ---
+
+from contextlib import asynccontextmanager  # noqa: E402
+
+import httpx  # noqa: E402
+
+from gateway.conftest import Mock, make_settings, serve  # noqa: E402
+from llmgw import mock_provider  # noqa: E402
+from llmgw.jobs.worker import Worker  # noqa: E402
+
+
+@pytest.fixture
+async def mock():
+    app = mock_provider.create_app()
+    async with serve(app) as url:
+        yield Mock(url, app.state.mock)
+
+
+@asynccontextmanager
+async def worker_env(database_url, pool, upstream_url, *, limiter=None, **overrides):
+    """A Worker on the test pool. Backoff is off unless overridden; heartbeats are quick."""
+    fields = dict(job_retry_base_s=0.0, job_retry_cap_s=0.0, job_heartbeat_s=0.05, job_lease_s=5.0)
+    settings = make_settings(database_url, upstream_url, **{**fields, **overrides})
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10, connect=1)) as http:
+        yield Worker(settings, pool=pool, http=http, limiter=limiter, rand=lambda: 0.0)
+
+
+@pytest.fixture
+async def worker(database_url, pool, mock):
+    async with worker_env(database_url, pool, mock.url) as w:
+        yield w
