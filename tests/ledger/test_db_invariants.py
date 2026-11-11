@@ -222,3 +222,84 @@ async def test_api_key_hash_is_32_bytes_and_unique(conn, accts):
     await conn.execute(insert, accts.team_id, b"\x01" * 32)
     with pytest.raises(asyncpg.UniqueViolationError):
         await conn.execute(insert, accts.team_id, b"\x01" * 32)
+
+
+async def test_retry_loss_posting_from_external(conn, accts):
+    retry_loss = await conn.fetchval(
+        "SELECT id FROM accounts WHERE org_id = $1 AND kind = 'retry_loss'", accts.org_id
+    )
+    await post(conn, accts.org_id, "retry_loss", "retry_loss:1:1", [(accts.external, -30), (retry_loss, 30)])
+    assert await balance(conn, retry_loss) == 30
+    assert await balance(conn, accts.external) == -30
+
+
+async def _job(conn, accts, **cols) -> int:
+    hold_id, _ = await _open_hold(conn, accts)
+    fields = {
+        "team_id": accts.team_id, "hold_id": hold_id, "request_hash": HASH, "model": "m",
+        "request": "{}", "prompt_estimate": 10, "max_tokens": 10, "max_attempts": 3,
+        "deadline": datetime.now(UTC) + timedelta(hours=1), **cols,
+    }
+    names = ", ".join(fields)
+    params = ", ".join(f"${i}" for i in range(1, len(fields) + 1))
+    return await conn.fetchval(
+        f"INSERT INTO jobs ({names}) VALUES ({params}) RETURNING id", *fields.values()
+    )
+
+
+@pytest.mark.parametrize(
+    "cols",
+    [
+        {"state": "running"},  # running needs locked_until
+        {"locked_until": datetime.now(UTC)},  # only running has a lease
+        {"state": "succeeded", "finished_at": datetime.now(UTC)},  # succeeded needs a result
+        {"state": "failed"},  # finished states need finished_at
+        {"finished_at": datetime.now(UTC)},  # queued isn't finished
+        {"attempts": 4},  # over max_attempts
+    ],
+)
+async def test_job_state_checks(conn, accts, cols):
+    with pytest.raises(asyncpg.CheckViolationError):
+        await _job(conn, accts, **cols)
+
+
+async def test_one_job_per_hold_and_per_idempotency_key(conn, accts):
+    job_id = await _job(conn, accts, idempotency_key="k")
+    hold_id = await conn.fetchval("SELECT hold_id FROM jobs WHERE id = $1", job_id)
+    insert = (
+        "INSERT INTO jobs (team_id, hold_id, idempotency_key, request_hash, model, request,"
+        " prompt_estimate, max_tokens, max_attempts, deadline)"
+        " VALUES ($1, $2, $3, $4, 'm', '{}', 10, 10, 3, now() + interval '1 hour')"
+    )
+    with pytest.raises(asyncpg.UniqueViolationError):
+        await conn.execute(insert, accts.team_id, hold_id, None, HASH)
+    other_hold = await post(
+        conn, accts.org_id, "hold", "hold-2", [(accts.team_available, -1), (accts.team_held, 1)]
+    )
+    other = await conn.fetchval(
+        "INSERT INTO holds (team_id, amount, hold_posting_id, expires_at)"
+        " VALUES ($1, 1, $2, now() + interval '1 hour') RETURNING id",
+        accts.team_id, other_hold,
+    )
+    with pytest.raises(asyncpg.UniqueViolationError):
+        await conn.execute(insert, accts.team_id, other, "k", HASH)
+
+
+async def test_one_row_per_attempt_and_posting(conn, accts):
+    job_id = await _job(conn, accts)
+    retry_loss = await conn.fetchval(
+        "SELECT id FROM accounts WHERE org_id = $1 AND kind = 'retry_loss'", accts.org_id
+    )
+    pid = await post(conn, accts.org_id, "retry_loss", "rl", [(accts.external, -5), (retry_loss, 5)])
+    insert = (
+        "INSERT INTO job_attempts (job_id, attempt, outcome, cost, retry_loss_posting_id)"
+        " VALUES ($1, $2, $3, 5, $4)"
+    )
+    await conn.execute(insert, job_id, 1, "retryable", pid)
+    with pytest.raises(asyncpg.UniqueViolationError):
+        await conn.execute(insert, job_id, 1, "lost", None)
+    with pytest.raises(asyncpg.UniqueViolationError):
+        await conn.execute(insert, job_id, 2, "retryable", pid)
+    # Only retryable and fenced attempts carry a retry-loss posting.
+    with pytest.raises(asyncpg.CheckViolationError):
+        await conn.execute(insert, job_id, 3, "succeeded", pid)
