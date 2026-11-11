@@ -9,6 +9,7 @@ Milestones 1 (ledger), 2 (synchronous path against the mock provider) and 3 (Red
 - Local DB with migrations: `docker compose up -d postgres && docker compose run --rm flyway`; Redis: `docker compose up -d redis`
 - Run locally: `uv run llmgw mock-provider` (port 8100), then `uv run llmgw gateway` (port 8000), and `uv run llmgw sweeper`. Rate limits are on only when `LLMGW_REDIS_URL` is set. No CLI creates orgs or teams yet; seed one with the snippet in README.md, and `uv run llmgw create-key --team-id N` adds keys to an existing team
 - Definition of done: `uv run pytest` passes, and migrations still pass Flyway `migrate validate` (CI `migrations` job)
+- Milestone work (plan, adversarial review, build, docs sweep): use the `/milestone` skill in `.claude/skills/milestone/`
 
 ## Map
 - `db/migrations/` — Flyway SQL; source of truth for schema and ledger invariants (see its CLAUDE.md)
