@@ -10,6 +10,9 @@ gateway forwards untouched:
     cut_after      drop the connection after this many tokens, before usage
     no_usage       finish normally but leave out the usage chunk
     prompt_tokens  report this prompt count instead of the mock's own count
+    key, script    per-attempt behaviour for a body that is re-sent unchanged
+                   (job retries): the i-th request carrying `key` merges
+                   script[min(i, len - 1)] over the fields above
 
 Provider limits (off unless set): `create_app(tpm=, rpm=)`, or
 LLMGW_MOCK_TPM / LLMGW_MOCK_RPM for `llmgw mock-provider`. Fixed 60 s windows.
@@ -53,6 +56,8 @@ class MockState:
     cut: int = 0
     disconnected: int = 0
     rate_limited: int = 0  # 429s from the mock's own TPM/RPM limits
+    script_calls: dict[str, int] = field(default_factory=dict)  # requests seen per `mock.key`
+    sent_chunks: int = 0  # content chunks sent, all streams; lets tests wait for a stream in progress
 
 
 @dataclass
@@ -108,6 +113,10 @@ def create_app(*, tpm: int | None = None, rpm: int | None = None, window_s: floa
         body = await request.json()
         state.requests.append(body)
         sc: dict[str, Any] = body.get("mock") or {}
+        if (key := sc.get("key")) is not None and sc.get("script"):
+            i = state.script_calls.get(key, 0)
+            state.script_calls[key] = i + 1
+            sc = {**sc, **sc["script"][min(i, len(sc["script"]) - 1)]}
 
         if (wait := window.admit()) is not None:
             state.rate_limited += 1
@@ -165,6 +174,7 @@ def create_app(*, tpm: int | None = None, rpm: int | None = None, window_s: floa
                         await asyncio.sleep(delay)
                     yield chunk({"content": f"tok{i} "})
                     sent += 1
+                    state.sent_chunks += 1
                 yield chunk({}, finish)
                 if include_usage and not sc.get("no_usage"):
                     yield _sse({
