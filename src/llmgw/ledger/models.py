@@ -30,6 +30,7 @@ class PostingKind(StrEnum):
     SETTLE = "settle"
     RELEASE = "release"
     EXPIRE = "expire"
+    RETRY_LOSS = "retry_loss"
 
 
 class HoldState(StrEnum):

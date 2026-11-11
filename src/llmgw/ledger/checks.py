@@ -62,4 +62,27 @@ async def check_ledger(conn: asyncpg.Connection) -> list[str]:
     ):
         problems.append(f"{r['kind']} posting {r['id']} has no matching hold")
 
+    for r in await conn.fetch(
+        """
+        SELECT p.id FROM postings p
+        WHERE p.kind = 'retry_loss'
+          AND NOT EXISTS (SELECT 1 FROM job_attempts a WHERE a.retry_loss_posting_id = p.id)
+        """
+    ):
+        problems.append(f"retry_loss posting {r['id']} has no matching job attempt")
+
+    # A live job's hold is open; a finished job's hold is closed the matching way.
+    for r in await conn.fetch(
+        """
+        SELECT j.id, j.state, h.state AS hold_state FROM jobs j JOIN holds h ON h.id = j.hold_id
+        WHERE h.state <> CASE j.state
+                           WHEN 'queued' THEN 'held'
+                           WHEN 'running' THEN 'held'
+                           WHEN 'succeeded' THEN 'settled'
+                           ELSE 'released'
+                         END::hold_state
+        """
+    ):
+        problems.append(f"job {r['id']} is {r['state']} but its hold is {r['hold_state']}")
+
     return problems

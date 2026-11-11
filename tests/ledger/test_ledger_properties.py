@@ -36,7 +36,7 @@ from llmgw.ledger.errors import IdempotencyConflict, InsufficientCredits, Invali
 N_TEAMS = 3
 INITIAL_POOL = 20_000
 INITIAL_GRANT = 1_000
-TRUNCATE = "TRUNCATE api_keys, holds, entries, postings, balances, accounts, teams, orgs RESTART IDENTITY CASCADE"
+TRUNCATE = "TRUNCATE api_keys, job_attempts, jobs, holds, entries, postings, balances, accounts, teams, orgs RESTART IDENTITY CASCADE"
 
 
 @dataclass

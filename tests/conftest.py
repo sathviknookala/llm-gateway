@@ -14,7 +14,7 @@ from testcontainers.community.postgres import PostgresContainer
 from testcontainers.community.redis import RedisContainer
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "db" / "migrations"
-TABLES = ("api_keys", "holds", "entries", "postings", "balances", "accounts", "teams", "orgs")
+TABLES = ("api_keys", "job_attempts", "jobs", "holds", "entries", "postings", "balances", "accounts", "teams", "orgs")
 _VERSIONED = re.compile(r"^V(\d+)__.+\.sql$")
 
 
