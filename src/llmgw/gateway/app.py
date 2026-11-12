@@ -34,6 +34,7 @@ and runs only if the acquire actually debited Redis.
 import asyncio
 import contextlib
 import math
+import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -46,12 +47,14 @@ import httpx
 import orjson
 import structlog
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
-from llmgw import auth
+from llmgw import auth, looplag, metrics
 from llmgw.config import Settings
 from llmgw.db import create_pool, transaction
 from llmgw.gateway import jobs
@@ -67,6 +70,12 @@ log = structlog.get_logger("llmgw.gateway")
 CLOSE_ATTEMPTS = 3
 
 
+def _set_event() -> asyncio.Event:
+    e = asyncio.Event()
+    e.set()
+    return e
+
+
 @dataclass
 class Gateway:
     settings: Settings
@@ -78,6 +87,10 @@ class Gateway:
     before_close: Any = None
     # Hold closes still running; shutdown waits for them before closing the pool.
     closing: set[asyncio.Future[None]] = field(default_factory=set)
+    # Set while no chat request is in flight. Shutdown waits for it before the
+    # drain: uvicorn cancels request tasks without awaiting them, and a
+    # cancelled request only creates its close task once it has unwound.
+    idle: asyncio.Event = field(default_factory=_set_event)
 
 
 @dataclass
@@ -98,6 +111,7 @@ class _Call:
     client_gone: bool = False
     started: bool = False  # response headers sent to the client
     finished: bool = False
+    arrived: float = 0.0  # perf_counter at request arrival, for the admission histogram
 
 
 def _error_body(message: str, code: str) -> bytes:
@@ -115,36 +129,45 @@ async def _send_error(send: Send, status: int, message: str, code: str, headers:
     await _send_json(send, status, _error_body(message, code), headers)
 
 
+async def _refuse(send: Send, status: int, message: str, code: str, headers: dict[str, str] | None = None) -> None:
+    """An error before any hold: counted by code."""
+    metrics.REFUSALS.labels(code).inc()
+    await _send_error(send, status, message, code, headers)
+
+
 class ChatCompletions:
     def __init__(self, gw: Gateway) -> None:
         self.gw = gw
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         gw, settings = self.gw, self.gw.settings
+        arrived = time.perf_counter()
         request = Request(scope, receive)
 
         key = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
         team_id = await auth.team_for_key(gw.pool, key) if key else None
         if team_id is None:
-            return await _send_error(send, 401, "invalid API key", "invalid_api_key")
+            return await _refuse(send, 401, "invalid API key", "invalid_api_key")
 
         parsed = parse_chat(await request.body(), settings, stream=True)
         if isinstance(parsed, Refusal):
-            return await _send_error(send, parsed.status, parsed.message, parsed.code)
+            return await _refuse(send, parsed.status, parsed.message, parsed.code)
         body, model, price = parsed.body, parsed.model, parsed.price
         cap_field, max_tokens = parsed.cap_field, parsed.max_tokens
 
         if gw.inflight >= settings.max_inflight:
-            return await _send_error(send, 429, "gateway at capacity", "capacity", {"retry-after": "1"})
+            return await _refuse(send, 429, "gateway at capacity", "capacity", {"retry-after": "1"})
 
         gw.inflight += 1
+        gw.idle.clear()
+        metrics.INFLIGHT.inc()
         try:
             prompt_estimate = parsed.prompt_estimate
             reserved_tokens = parsed.reserved_tokens
             debited = False
             if gw.limiter is not None:
                 if gw.limiter.oversized(team_id, model, reserved_tokens):
-                    return await _send_error(
+                    return await _refuse(
                         send, 400,
                         f"request needs up to {reserved_tokens} tokens, more than a rate-limit bucket holds",
                         "request_exceeds_rate_limit",
@@ -153,7 +176,7 @@ class ChatCompletions:
                 if not decision.allowed:
                     provider = "model" in decision.blocked
                     retry = str(max(1, math.ceil(decision.wait_ms / 1000)))
-                    return await _send_error(
+                    return await _refuse(
                         send, 429,
                         "provider budget exhausted" if provider else "team rate limit exceeded",
                         "provider_budget_exhausted" if provider else "team_rate_limited",
@@ -174,7 +197,7 @@ class ChatCompletions:
                     )
             except InsufficientCredits:
                 await self._refund_tokens(team_id, model, reserved_tokens, debited)
-                return await _send_error(
+                return await _refuse(
                     send, 402, f"insufficient credits: this request holds {amount}", "insufficient_credits"
                 )
             except BaseException:
@@ -189,6 +212,7 @@ class ChatCompletions:
                 "stream_options": {**(body.get("stream_options") or {}), "include_usage": True},
             }
             call = _Call(hold.id, request_id, team_id, model, price, prompt_estimate, reserved_tokens, debited)
+            call.arrived = arrived
             # Bound for the stream and the close: the close task copies this context.
             with structlog.contextvars.bound_contextvars(request_id=request_id, team_id=team_id):
                 try:
@@ -203,6 +227,9 @@ class ChatCompletions:
                         await asyncio.shield(close)
         finally:
             gw.inflight -= 1
+            metrics.INFLIGHT.dec()
+            if gw.inflight == 0:
+                gw.idle.set()
 
     async def _proxy(self, call: _Call, upstream_body: dict[str, Any], receive: Receive, send: Send) -> None:
         """Forward the request and stream the reply. Returns normally on cut-offs and disconnects."""
@@ -212,10 +239,12 @@ class ChatCompletions:
                 with anyio.fail_after(self.gw.settings.upstream_timeout_s):
                     await self._stream(call, upstream_body, send)
             except TimeoutError:
+                metrics.UPSTREAM_ERRORS.labels("sync", "timeout").inc()
                 log.warning("upstream_timeout", request_id=call.request_id)
                 await self._end_stream(call, send, 504, "provider timed out", "upstream_timeout")
             except httpx.TransportError as e:
                 # The request was sent, so the provider may bill it: settle on an estimate.
+                metrics.UPSTREAM_ERRORS.labels("sync", "cut").inc()
                 log.warning("upstream_cut", request_id=call.request_id, error=repr(e))
                 await self._end_stream(call, send, 502, "provider connection failed", "upstream_error")
             tg.cancel_scope.cancel()
@@ -239,17 +268,20 @@ class ChatCompletions:
             "POST", settings.upstream_url.rstrip("/") + "/v1/chat/completions",
             content=orjson.dumps(upstream_body), headers=headers,
         )
+        metrics.ADMISSION.observe(time.perf_counter() - call.arrived)
         call.sent_upstream = True
         try:
             resp = await gw.http.send(req, stream=True)
         except (httpx.ConnectError, httpx.ConnectTimeout) as e:
             call.refused = True
+            metrics.UPSTREAM_ERRORS.labels("sync", "unreachable").inc()
             log.warning("upstream_unreachable", request_id=call.request_id, error=repr(e))
             return await _send_error(send, 502, "provider unreachable", "upstream_unreachable")
         try:
             if resp.status_code != 200:
                 call.refused = True
                 detail = await resp.aread()
+                metrics.UPSTREAM_ERRORS.labels("sync", _status_kind(resp.status_code)).inc()
                 log.warning("upstream_error", request_id=call.request_id, status=resp.status_code)
                 if resp.status_code == 429:
                     retry = {"retry-after": resp.headers["retry-after"]} if "retry-after" in resp.headers else None
@@ -339,14 +371,73 @@ class ChatCompletions:
                         if attempt == CLOSE_ATTEMPTS:
                             raise
                         await asyncio.sleep(0.05 * attempt)
+            metrics.HOLD_CLOSES.labels("sync", op, str(flagged).lower()).inc()
             log.info("hold_closed", **fields)
         except Exception:
             # Left open: the sweeper expires it and reconciliation books the cost.
+            metrics.HOLD_CLOSE_FAILURES.labels("sync").inc()
             log.exception("hold_close_failed", **fields)
+
+
+def _status_kind(status: int) -> str:
+    if status == 429:
+        return "status_429"
+    return "status_4xx" if 400 <= status < 500 else "status_5xx"
 
 
 async def _healthz(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True})
+
+
+async def _readyz(request: Request) -> JSONResponse:
+    """Ready when Postgres answers. Redis is reported but never fails readiness:
+    the limiter fails open by design."""
+    gw: Gateway = request.app.state.gateway
+    body = {"db": "ok", "redis": "off"}
+    try:
+        async with asyncio.timeout(1):
+            await gw.pool.fetchval("SELECT 1")
+    except Exception:
+        body["db"] = "down"
+    if gw.limiter is not None:
+        body["redis"] = "ok" if await gw.limiter.ping() else "down"
+    return JSONResponse(body, status_code=200 if body["db"] == "ok" else 503)
+
+
+async def _metrics(request: Request) -> Response:
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+_ROUTES = {"/v1/chat/completions", "/v1/jobs", "/healthz", "/readyz", "/metrics"}
+
+
+def _route(path: str) -> str:
+    if path in _ROUTES:
+        return path
+    return "/v1/jobs/{id}" if path.startswith("/v1/jobs/") else "other"
+
+
+class _CountResponses:
+    """Counts responses by route template and status ("none" if nothing was sent)."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        status = "none"
+
+        async def counting_send(message) -> None:
+            nonlocal status
+            if message["type"] == "http.response.start":
+                status = str(message["status"])
+            await send(message)
+
+        try:
+            await self.app(scope, receive, counting_send)
+        finally:
+            metrics.HTTP_REQUESTS.labels(_route(scope["path"]), status).inc()
 
 
 def create_app(
@@ -369,6 +460,8 @@ def create_app(
                     settings.redis_url, settings.rate_limits, timeout_s=settings.redis_timeout_s
                 )
                 stack.push_async_callback(gw.limiter.aclose)
+            lag = asyncio.create_task(looplag.monitor(settings.loop_lag_interval_s))
+            stack.push_async_callback(looplag.stop, lag)
             if gw.http is None:
                 gw.http = httpx.AsyncClient(
                     timeout=httpx.Timeout(settings.upstream_timeout_s, connect=settings.upstream_connect_timeout_s),
@@ -378,6 +471,12 @@ def create_app(
             try:
                 yield
             finally:
+                # Requests uvicorn cancelled may not have reached their close yet.
+                try:
+                    async with asyncio.timeout(2 + settings.settle_timeout_s + settings.redis_timeout_s):
+                        await gw.idle.wait()
+                except TimeoutError:
+                    log.warning("shutdown_requests_pending", inflight=gw.inflight)
                 if gw.closing:
                     # A close is the ledger write plus a token refund, each with its own timeout.
                     await asyncio.wait(gw.closing, timeout=settings.settle_timeout_s + settings.redis_timeout_s + 1)
@@ -388,8 +487,11 @@ def create_app(
             Route("/v1/jobs", jobs.submit, methods=["POST"]),
             Route("/v1/jobs/{job_id:int}", jobs.get, methods=["GET"]),
             Route("/healthz", _healthz),
+            Route("/readyz", _readyz),
+            Route("/metrics", _metrics),
         ],
         lifespan=lifespan,
+        middleware=[Middleware(_CountResponses)],
     )
     app.state.gateway = gw
     return app

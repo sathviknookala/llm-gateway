@@ -11,6 +11,12 @@ import time
 from llmgw.metrics import EVENT_LOOP_LAG
 
 
+async def stop(task: asyncio.Task) -> None:
+    """Cancel the monitor and wait for it, without swallowing our own cancellation."""
+    task.cancel()
+    await asyncio.wait([task])
+
+
 async def monitor(interval_s: float) -> None:
     while True:
         t0 = time.monotonic()

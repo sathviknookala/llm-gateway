@@ -33,6 +33,8 @@ import redis.asyncio as aioredis
 import structlog
 from redis.exceptions import RedisError
 
+from llmgw import metrics
+
 log = structlog.get_logger("llmgw.ratelimit")
 
 WINDOW_MS = 60_000
@@ -195,6 +197,14 @@ class RateLimiter:
     async def aclose(self) -> None:
         await self.client.aclose()
 
+    async def ping(self) -> bool:
+        """True if Redis answers within the limiter's timeout. Never raises."""
+        try:
+            async with asyncio.timeout(self.timeout_s):
+                return bool(await self.client.ping())
+        except (RedisError, OSError, TimeoutError):
+            return False
+
     def token_buckets(self, team_id: int, model: str) -> list[Bucket]:
         out = []
         if self.limits.team_tpm is not None:
@@ -228,6 +238,7 @@ class RateLimiter:
             async with asyncio.timeout(self.timeout_s):
                 result = await self._acquire(keys=keys, args=args)
         except (RedisError, OSError, TimeoutError) as e:
+            metrics.RATELIMIT_UNAVAILABLE.labels("acquire").inc()
             log.warning("ratelimit_unavailable", op="acquire", error=repr(e))
             return Decision(allowed=True, debited=False)
         if int(result[0]) == 1:
@@ -247,6 +258,7 @@ class RateLimiter:
             async with asyncio.timeout(self.timeout_s):
                 await self._refund(keys=keys, args=args)
         except (RedisError, OSError, TimeoutError) as e:
+            metrics.RATELIMIT_UNAVAILABLE.labels("refund").inc()
             log.warning("ratelimit_unavailable", op="refund", error=repr(e))
 
     async def level(self, key: str) -> float | None:

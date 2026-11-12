@@ -15,7 +15,7 @@ from typing import Any
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from llmgw import auth
+from llmgw import auth, metrics
 from llmgw.db import transaction
 from llmgw.gateway.request import Refusal, parse_chat
 from llmgw.jobs import queue
@@ -27,6 +27,8 @@ MAX_KEY_LENGTH = 255
 
 
 def _error(status: int, message: str, code: str) -> JSONResponse:
+    """Every job-route error is a refusal: nothing was enqueued."""
+    metrics.REFUSALS.labels(code).inc()
     return JSONResponse({"error": {"message": message, "type": "llmgw", "code": code}}, status_code=status)
 
 
