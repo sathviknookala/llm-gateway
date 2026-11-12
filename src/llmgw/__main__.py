@@ -81,18 +81,23 @@ async def _create_key(team_id: int) -> str:
 
 
 async def _sweep() -> None:
-    from llmgw import config, logs, sweeper
+    from llmgw import config, logs, looplag, metrics, sweeper
     from llmgw.db import create_pool
 
     settings = config.load()
     logs.configure(settings.log_format, settings.log_level)
+    if settings.metrics_port is not None:
+        metrics.serve(settings.metrics_port, settings.metrics_host)
     pool = await create_pool(settings)
+    lag = asyncio.create_task(looplag.monitor(settings.loop_lag_interval_s))
     try:
         await sweeper.run(
             pool, interval_s=settings.sweep_interval_s, batch=settings.sweep_batch,
             retry_base_s=settings.job_retry_base_s, retry_cap_s=settings.job_retry_cap_s,
+            ledger_check_interval_s=settings.ledger_check_interval_s,
         )
     finally:
+        await looplag.stop(lag)
         await pool.close()
 
 

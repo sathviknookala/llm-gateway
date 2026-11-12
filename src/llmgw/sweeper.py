@@ -24,16 +24,22 @@ The same loop backs the job queue, one job per transaction, picked the same way:
   dead-lettered when out of attempts or past its deadline); the attempt is
   recorded as `lost`.
 - deadlines: a queued job past its deadline is dead-lettered, hold released.
+
+After each pass it refreshes the database gauges (`llmgw.stats.collect`), and
+every `ledger_check_interval_s` it runs `check_ledger` and exports the count.
 """
 
 import asyncio
 import random
+import time
 from collections.abc import Awaitable, Callable
 
 import asyncpg
 import structlog
 
+from llmgw import metrics, stats
 from llmgw.jobs import queue
+from llmgw.jobs.queue import JobState
 from llmgw.jobs.errors import JobNotFound
 from llmgw.ledger import holds
 from llmgw.ledger.errors import HoldNotFound, InvalidHoldState
@@ -68,6 +74,7 @@ async def sweep_once(pool: asyncpg.Pool, *, batch: int = 500) -> int:
                         break
                     await holds.expire(conn, hold_id=hold_id)
                 expired += 1
+                metrics.SWEEPER_ACTIONS.labels("hold_expired").inc()
                 log.info("hold_expired", hold_id=hold_id)
             except (InvalidHoldState, HoldNotFound) as e:
                 # Closed by another path between pick and expire; nothing to do.
@@ -119,6 +126,10 @@ async def _per_job(
                     acted = await act(conn, job_id)
                 if acted:
                     done += 1
+                    metrics.SWEEPER_ACTIONS.labels(event).inc()
+                    # expire_deadline → True, reclaim → DEAD: both released the hold.
+                    if acted is True or acted == JobState.DEAD:
+                        metrics.HOLD_CLOSES.labels("job_sweeper", "release", "false").inc()
                     log.info(event, job_id=job_id, result=str(acted))
                 else:
                     failed.append(job_id)
@@ -153,9 +164,11 @@ async def expire_deadlines_once(pool: asyncpg.Pool, *, batch: int = 500) -> int:
 
 
 async def run(
-    pool: asyncpg.Pool, *, interval_s: float, batch: int, retry_base_s: float = 1.0, retry_cap_s: float = 60.0
+    pool: asyncpg.Pool, *, interval_s: float, batch: int, retry_base_s: float = 1.0, retry_cap_s: float = 60.0,
+    ledger_check_interval_s: float = 0.0,
 ) -> None:
     """Sweep forever. A lost connection ends the pass; the next one retries."""
+    next_check = time.monotonic()
     while True:
         try:
             expired = await sweep_once(pool, batch=batch)
@@ -164,5 +177,16 @@ async def run(
             if expired or reclaimed or dead:
                 log.info("sweep_pass", expired=expired, reclaimed=reclaimed, deadline=dead)
         except Exception:
+            metrics.SWEEP_PASS_FAILURES.inc()
             log.exception("sweep_pass_failed")
+        try:
+            await stats.collect(pool)
+        except Exception:
+            log.exception("stats_collect_failed")
+        if ledger_check_interval_s > 0 and time.monotonic() >= next_check:
+            next_check = time.monotonic() + ledger_check_interval_s
+            try:
+                await stats.check(pool)
+            except Exception:
+                log.exception("ledger_check_failed")
         await asyncio.sleep(interval_s)
