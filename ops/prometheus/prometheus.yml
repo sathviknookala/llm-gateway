@@ -1,0 +1,24 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: gateway
+    dns_sd_configs:
+      - names: [gateway]
+        type: A
+        port: 8000
+  # Every replica under `--scale worker=N`: Compose DNS returns one A record each.
+  - job_name: worker
+    dns_sd_configs:
+      - names: [worker]
+        type: A
+        port: 9100
+  - job_name: sweeper
+    dns_sd_configs:
+      - names: [sweeper]
+        type: A
+        port: 9100

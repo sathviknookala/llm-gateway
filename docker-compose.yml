@@ -1,5 +1,30 @@
-# Local dev: Postgres (ledger and job queue) and Redis (rate limits). The
-# gateway, worker, sweeper and mock provider run from `uv run llmgw <mode>`.
+# Local dev: Postgres (ledger and job queue) and Redis (rate limits) with no
+# profile, so `docker compose up -d postgres` still works on its own and the app
+# runs from `uv run llmgw <mode>`.
+#
+# The whole stack (profile `stack`): the app image in every mode, the mock
+# provider, Prometheus and Grafana:
+#   docker compose --profile stack up -d --build [--scale worker=2]
+# Deploy overlay: deploy/docker-compose.deploy.yml. Fault overlay:
+# docker-compose.faults.yml.
+
+x-llmgw: &llmgw
+  build: .
+  image: llmgw:local
+  restart: unless-stopped
+  depends_on:
+    flyway:
+      condition: service_completed_successfully
+    redis:
+      condition: service_healthy
+  environment: &llmgw-env
+    LLMGW_DATABASE_URL: postgresql://llmgw:llmgw@postgres:5432/llmgw
+    LLMGW_REDIS_URL: redis://redis:6379/0
+    LLMGW_UPSTREAM_URL: http://mock-provider:8100
+    LLMGW_HOST: 0.0.0.0
+    LLMGW_LOG_FORMAT: json
+    LLMGW_METRICS_PORT: "9100"
+
 services:
   postgres:
     image: postgres:17-alpine
@@ -38,5 +63,83 @@ services:
       postgres:
         condition: service_healthy
 
+  # --- the app (profile: stack) ---
+
+  mock-provider:
+    <<: *llmgw
+    profiles: [stack]
+    command: [mock-provider]
+    depends_on: {}
+    environment:
+      LLMGW_MOCK_HOST: 0.0.0.0  # binds 127.0.0.1 otherwise
+      LLMGW_LOG_FORMAT: json
+
+  gateway:
+    <<: *llmgw
+    profiles: [stack]
+    command: [gateway]
+    environment:
+      <<: *llmgw-env
+      LLMGW_DB_POOL_MAX: "20"
+    ports:
+      - "${LLMGW_GATEWAY_PORT:-8000}:8000"
+    # uvicorn gives streams LLMGW_SHUTDOWN_GRACE_S (20 s), then the close drain
+    # takes up to ~14 s more; Docker's SIGKILL must come after that.
+    stop_grace_period: 40s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Scale with --scale worker=N; Prometheus finds every replica by DNS.
+  worker:
+    <<: *llmgw
+    profiles: [stack]
+    command: [worker]
+    environment:
+      <<: *llmgw-env
+      LLMGW_DB_POOL_MAX: "10"
+    stop_grace_period: 20s
+
+  sweeper:
+    <<: *llmgw
+    profiles: [stack]
+    command: [sweeper]
+    environment:
+      <<: *llmgw-env
+      LLMGW_DB_POOL_MAX: "4"
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    profiles: [stack]
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+    volumes:
+      - ./ops/prometheus:/etc/prometheus:ro
+      - promdata:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    profiles: [stack]
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${LLMGW_GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
+
 volumes:
   pgdata:
+  promdata:
+  grafanadata:
