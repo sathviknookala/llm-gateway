@@ -37,10 +37,11 @@ def test_structlog_event_is_json_with_bound_context(json_logs):
 
 
 def test_stdlib_records_are_json_too(json_logs):
-    logging.getLogger("uvicorn.access").info("GET /healthz 200")
+    # Not a uvicorn logger: in-process uvicorn servers in other tests reconfigure those.
+    logging.getLogger("some.library").info("GET /healthz 200")
     [line] = lines(json_logs)
     assert line["event"] == "GET /healthz 200"
-    assert line["logger"] == "uvicorn.access"
+    assert line["logger"] == "some.library"
 
 
 def test_exceptions_are_rendered(json_logs):

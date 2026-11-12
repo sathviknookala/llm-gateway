@@ -93,11 +93,11 @@ async def funded(conn):
 
 
 @asynccontextmanager
-async def gateway_env(database_url, pool, upstream_url, funded, **overrides):
+async def gateway_env(database_url, pool, upstream_url, funded, *, limiter=None, **overrides):
     org, team, key = funded
     settings = make_settings(database_url, upstream_url, **overrides)
     async with httpx.AsyncClient(timeout=httpx.Timeout(10, connect=1)) as upstream:
-        app = create_app(settings, pool=pool, http=upstream)
+        app = create_app(settings, pool=pool, http=upstream, limiter=limiter)
         async with serve(app) as url:
             async with httpx.AsyncClient(
                 base_url=url, headers={"authorization": f"Bearer {key}"}, timeout=10

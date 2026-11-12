@@ -5,6 +5,8 @@ import socket
 
 import pytest
 
+from conftest import metric
+
 from llmgw.ratelimit import ModelLimit, RateLimiter, RateLimits, model_key, team_key
 
 TEAM = 1
@@ -146,8 +148,13 @@ async def test_fails_open_when_redis_is_unreachable():
         f"redis://127.0.0.1:{_closed_port()}/0", RateLimits(team_tpm=10), timeout_s=0.25
     )
     try:
+        acquire0 = metric("llmgw_ratelimit_unavailable_total", op="acquire")
+        refund0 = metric("llmgw_ratelimit_unavailable_total", op="refund")
         d = await rl.acquire(TEAM, MODEL, 1_000)
         assert d.allowed and not d.debited
         await rl.refund(TEAM, MODEL, 1_000)  # never raises
+        assert metric("llmgw_ratelimit_unavailable_total", op="acquire") == acquire0 + 1
+        assert metric("llmgw_ratelimit_unavailable_total", op="refund") == refund0 + 1
+        assert await rl.ping() is False
     finally:
         await rl.aclose()
