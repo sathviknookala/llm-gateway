@@ -18,23 +18,28 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "gateway":
         import uvicorn
 
-        from llmgw import config
+        from llmgw import config, logs
         from llmgw.gateway.app import create_app
 
         settings = config.load()
-        uvicorn.run(create_app(settings), host=settings.host, port=settings.port)
+        logs.configure(settings.log_format, settings.log_level)
+        # log_config=None: keep our handler instead of uvicorn's dictConfig.
+        uvicorn.run(create_app(settings), host=settings.host, port=settings.port, log_config=None)
         return 0
 
     if args.mode == "mock-provider":
         import uvicorn
 
+        from llmgw import logs
         from llmgw.mock_provider import create_app
 
+        logs.configure(os.environ.get("LLMGW_LOG_FORMAT", "console"), os.environ.get("LLMGW_LOG_LEVEL", "info"))
         tpm, rpm = os.environ.get("LLMGW_MOCK_TPM"), os.environ.get("LLMGW_MOCK_RPM")
         uvicorn.run(
             create_app(tpm=int(tpm) if tpm else None, rpm=int(rpm) if rpm else None),
             host=os.environ.get("LLMGW_MOCK_HOST", "127.0.0.1"),
             port=int(os.environ.get("LLMGW_MOCK_PORT", "8100")),
+            log_config=None,
         )
         return 0
 
@@ -49,11 +54,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.mode == "worker":
-        from llmgw import config
+        from llmgw import config, logs
         from llmgw.jobs import worker
 
+        settings = config.load()
+        logs.configure(settings.log_format, settings.log_level)
         with contextlib.suppress(KeyboardInterrupt):
-            asyncio.run(worker.serve(config.load()))
+            asyncio.run(worker.serve(settings))
         return 0
 
     print(f"llmgw: mode '{args.mode}' is not implemented yet", file=sys.stderr)
@@ -74,10 +81,11 @@ async def _create_key(team_id: int) -> str:
 
 
 async def _sweep() -> None:
-    from llmgw import config, sweeper
+    from llmgw import config, logs, sweeper
     from llmgw.db import create_pool
 
     settings = config.load()
+    logs.configure(settings.log_format, settings.log_level)
     pool = await create_pool(settings)
     try:
         await sweeper.run(

@@ -189,16 +189,18 @@ class ChatCompletions:
                 "stream_options": {**(body.get("stream_options") or {}), "include_usage": True},
             }
             call = _Call(hold.id, request_id, team_id, model, price, prompt_estimate, reserved_tokens, debited)
-            try:
-                await self._proxy(call, upstream_body, receive, send)
-            finally:
-                # Its own task, so even repeated Task.cancel() on this request
-                # can't stop the commit; the lifespan drains these on shutdown.
-                close = asyncio.ensure_future(self._close(call))
-                gw.closing.add(close)
-                close.add_done_callback(gw.closing.discard)
-                with anyio.CancelScope(shield=True):
-                    await asyncio.shield(close)
+            # Bound for the stream and the close: the close task copies this context.
+            with structlog.contextvars.bound_contextvars(request_id=request_id, team_id=team_id):
+                try:
+                    await self._proxy(call, upstream_body, receive, send)
+                finally:
+                    # Its own task, so even repeated Task.cancel() on this request
+                    # can't stop the commit; the lifespan drains these on shutdown.
+                    close = asyncio.ensure_future(self._close(call))
+                    gw.closing.add(close)
+                    close.add_done_callback(gw.closing.discard)
+                    with anyio.CancelScope(shield=True):
+                        await asyncio.shield(close)
         finally:
             gw.inflight -= 1
 

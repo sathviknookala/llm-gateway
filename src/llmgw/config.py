@@ -49,8 +49,13 @@ class Settings:
     worker_concurrency: int = 8
     worker_poll_s: float = 1.0
     worker_id: str = field(default_factory=lambda: f"{socket.gethostname()}:{os.getpid()}")
+    # Observability
+    log_format: str = "console"
+    log_level: str = "info"
 
     def __post_init__(self) -> None:
+        if self.log_format not in ("console", "json"):
+            raise ValueError("log_format must be 'console' or 'json'")
         if self.upstream_timeout_s + self.settle_timeout_s >= self.hold_ttl_s:
             raise ValueError("hold_ttl_s must exceed upstream_timeout_s + settle_timeout_s")
         positive = (
@@ -113,4 +118,6 @@ def load() -> Settings:
         worker_concurrency=int(env("LLMGW_WORKER_CONCURRENCY", "8")),
         worker_poll_s=float(env("LLMGW_WORKER_POLL_S", "1")),
         worker_id=env("LLMGW_WORKER_ID") or f"{socket.gethostname()}:{os.getpid()}",
+        log_format=env("LLMGW_LOG_FORMAT", "console"),
+        log_level=env("LLMGW_LOG_LEVEL", "info"),
     )

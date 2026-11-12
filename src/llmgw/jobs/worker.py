@@ -141,18 +141,20 @@ class Worker:
         job = await queue.lease(self.pool, worker=s.worker_id, lease_s=s.job_lease_s)
         if job is None:
             return None
-        log.info("job_leased", job_id=job.id, attempt=job.attempts, token=job.lease_token)
-        a = _Attempt(job, s.prices.get(job.model), job.prompt_estimate + job.max_tokens)
-        try:
-            await self._admit(a)
-            if a.refusal is None and a.requeue_after_s is None:
-                await self._call(a)
-        finally:
-            finish = asyncio.ensure_future(self._finish(a))
-            self.finishing.add(finish)
-            finish.add_done_callback(self.finishing.discard)
-            with anyio.CancelScope(shield=True):
-                outcome = await asyncio.shield(finish)
+        # Bound for the call and the finish: the finish task copies this context.
+        with structlog.contextvars.bound_contextvars(job_id=job.id, attempt=job.attempts, lease_token=job.lease_token):
+            log.info("job_leased", job_id=job.id, attempt=job.attempts, token=job.lease_token)
+            a = _Attempt(job, s.prices.get(job.model), job.prompt_estimate + job.max_tokens)
+            try:
+                await self._admit(a)
+                if a.refusal is None and a.requeue_after_s is None:
+                    await self._call(a)
+            finally:
+                finish = asyncio.ensure_future(self._finish(a))
+                self.finishing.add(finish)
+                finish.add_done_callback(self.finishing.discard)
+                with anyio.CancelScope(shield=True):
+                    outcome = await asyncio.shield(finish)
         return outcome
 
     # --- before the call ---
