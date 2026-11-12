@@ -11,6 +11,7 @@ import asyncpg
 import pytest
 import redis.asyncio as aioredis
 from testcontainers.community.postgres import PostgresContainer
+from prometheus_client import REGISTRY
 from testcontainers.community.redis import RedisContainer
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "db" / "migrations"
@@ -35,6 +36,14 @@ async def _migrate(url: str) -> None:
                 await conn.execute(path.read_text())
     finally:
         await conn.close()
+
+
+def metric(name: str, **labels: str) -> float:
+    """Current value of a sample in the process-global registry (0 if unset).
+
+    The registry outlives tests, so tests assert deltas: read before, act, read after.
+    """
+    return REGISTRY.get_sample_value(name, labels) or 0.0
 
 
 @pytest.fixture(scope="session")

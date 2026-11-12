@@ -22,6 +22,8 @@ def test_defaults_are_valid():
         {"job_retry_base_s": 10, "job_retry_cap_s": 5},
         {"job_retry_base_s": -1},
         {"log_format": "xml"},
+        {"loop_lag_interval_s": 0},
+        {"shutdown_grace_s": -1},
     ],
 )
 def test_rejects_bad_job_settings(bad):
