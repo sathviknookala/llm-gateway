@@ -1,0 +1,53 @@
+# Fault-test overlay: toxiproxy between the app and Postgres, Redis and the
+# provider, plus short timings so a run settles in minutes. Driven by bench/faults.py:
+#   docker compose -f docker-compose.yml -f docker-compose.faults.yml --profile stack up -d --build
+# Flyway and the harness's own checks talk to Postgres directly.
+
+x-fault-env: &fault-env
+  LLMGW_DATABASE_URL: postgresql://llmgw:llmgw@toxiproxy:15432/llmgw
+  LLMGW_REDIS_URL: redis://toxiproxy:16379/0
+  LLMGW_UPSTREAM_URL: http://toxiproxy:18100
+  # Generous limits, so every request goes through Redis (no buckets → no Redis call).
+  LLMGW_TEAM_TPM: "100000000"
+  LLMGW_TEAM_RPM: "1000000"
+  # TTL 40 > upstream timeout 20 + settle 5 (the Settings guard).
+  LLMGW_HOLD_TTL_S: "40"
+  LLMGW_UPSTREAM_TIMEOUT_S: "20"
+  LLMGW_SETTLE_TIMEOUT_S: "5"
+  LLMGW_JOB_LEASE_S: "6"
+  LLMGW_JOB_HEARTBEAT_S: "2"
+  LLMGW_JOB_RETRY_CAP_S: "5"
+  LLMGW_SWEEP_INTERVAL_S: "2"
+  LLMGW_SHUTDOWN_GRACE_S: "5"
+  LLMGW_LEDGER_CHECK_INTERVAL_S: "30"
+
+services:
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    profiles: [stack]
+    command: [-host=0.0.0.0, -config=/toxiproxy.json]
+    volumes:
+      - ./bench/toxiproxy.json:/toxiproxy.json:ro
+    ports:
+      - "127.0.0.1:8474:8474"  # the harness's control API
+
+  gateway:
+    environment: *fault-env
+    depends_on:
+      toxiproxy:
+        condition: service_started
+
+  worker:
+    # Four replicas (64 Postgres connections in all, under the default 100), so
+    # slow and retried jobs drain; every `up` in the harness keeps this count.
+    scale: 4
+    environment: *fault-env
+    depends_on:
+      toxiproxy:
+        condition: service_started
+
+  sweeper:
+    environment: *fault-env
+    depends_on:
+      toxiproxy:
+        condition: service_started
