@@ -15,6 +15,42 @@ jobs:
       # testcontainers starts its own Postgres through the runner's Docker daemon.
       - run: uv run pytest
 
+  image:
+    # The image builds, every Compose file and overlay resolves, only Caddy is
+    # public in the deploy overlay, and the Prometheus and Caddy configs parse.
+    runs-on: ubuntu-latest
+    env:
+      LLMGW_DOMAIN: ci.example.com
+      LLMGW_PG_PASSWORD: ci
+      LLMGW_GRAFANA_PASSWORD: ci
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t llmgw:ci .
+      - run: docker run --rm llmgw:ci --help
+      - run: |
+          docker compose config -q
+          docker compose --profile stack --profile bench config -q
+          docker compose -f docker-compose.yml -f docker-compose.faults.yml --profile stack config -q
+      - name: Deploy overlay publishes nothing but Caddy
+        run: |
+          docker compose -f docker-compose.yml -f deploy/docker-compose.deploy.yml --profile stack config --format json \
+            | python3 -c '
+          import json, sys
+          services = json.load(sys.stdin)["services"]
+          public = {name for name, svc in services.items()
+                    for p in svc.get("ports", []) if p.get("host_ip") != "127.0.0.1"}
+          assert public == {"caddy"}, public
+          print("public:", public)'
+      - name: Deploy overlay refuses a missing password
+        run: |
+          ! env -u LLMGW_PG_PASSWORD docker compose -f docker-compose.yml -f deploy/docker-compose.deploy.yml --profile stack config -q
+      - run: >
+          docker run --rm --entrypoint promtool -v "$PWD/ops/prometheus:/etc/prometheus:ro"
+          prom/prometheus:v3.1.0 check config /etc/prometheus/prometheus.yml
+      - run: >
+          docker run --rm -e LLMGW_DOMAIN=ci.example.com -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro"
+          caddy:2.8.4 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
   migrations:
     # Tests apply db/migrations with a plain SQL runner; this job checks that
     # real Flyway accepts the same files.
