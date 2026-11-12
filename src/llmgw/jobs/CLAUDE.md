@@ -8,7 +8,8 @@ Not responsible for: the HTTP routes (`llmgw/gateway/jobs.py`), ledger rules (`l
   - `lease` → next queued job with `run_after <= now()` and `deadline > now()`, FIFO by `(run_after, id)`, `FOR UPDATE SKIP LOCKED`; bumps `attempts` and `lease_token`.
   - `renew` raises `LeaseLost` on a stale token.
   - Finishes take `(job_id, token, attempt)`: `complete` (settle + result + `succeeded`), `fail_attempt` (retry loss if `cost > 0`, then queued / `failed` / `dead`), `requeue_unstarted` (nothing sent: give the attempt back). They return an `Outcome`.
-- `worker.py`: `Worker.run_one()` does one attempt and returns its `Outcome` (None if nothing was ready); `Worker.run()` runs `worker_concurrency` loops; `serve(settings)` is the CLI mode.
+- `worker.py`: `Worker.run_one()` does one attempt and returns its `Outcome` (None if nothing was ready); `Worker.run()` runs `worker_concurrency` loops; `serve(settings)` is the CLI mode (metrics side port when `LLMGW_METRICS_PORT` is set, loop-lag monitor). The CLI cancels `serve` on the first SIGTERM/SIGINT, so pending finishes drain; a second signal gets the default action.
+- Metrics: `llmgw_job_attempts_total{outcome}`, `llmgw_job_finish_failures_total`, `llmgw_job_queue_wait_seconds` (ready → leased, from `locked_until − lease_s − run_after`, both on the DB clock), `llmgw_lease_lost_total`, `llmgw_upstream_errors_total{path="job",kind}`, and `llmgw_hold_closes_total{path="job",op}`.
 - `last_error` codes: `upstream_<status>`, `upstream_unreachable`, `upstream_cut`, `upstream_timeout`, `lease_lost`, `deadline`, `hold_closed`, `request_exceeds_rate_limit`, `model_not_found`, `team_rate_limited`, `provider_budget_exhausted`, `interrupted`.
 
 ## Invariants
@@ -38,3 +39,4 @@ Not responsible for: the HTTP routes (`llmgw/gateway/jobs.py`), ledger rules (`l
 - A heartbeat that can't reach the database for a whole lease raises `LeaseLost`, but the lease may still be ours. The worker then calls the token-checked `fail_attempt`, never `_record_fenced` directly.
 - The worker's rate-limit acquire uses the same buckets as the synchronous path; holding headroom back for interactive traffic is milestone 6.
 - `Worker.before_finish` is a test hook awaited inside the shielded finish.
+- Job hold closes are counted from what the worker already knows, never a read after the commit (another worker may have finished the job since): SUCCEEDED → settle; PERMANENT → release unless `a.hold_closed`; RETRYABLE → release only when `attempts >= max_attempts`. Sweeper dead-letters count as `path="job_sweeper"`.
