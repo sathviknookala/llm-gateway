@@ -52,6 +52,14 @@ class Settings:
     # Observability
     log_format: str = "console"
     log_level: str = "info"
+    # Worker and sweeper metrics side port; None = off (the gateway serves /metrics itself).
+    metrics_port: int | None = None
+    metrics_host: str = "0.0.0.0"
+    loop_lag_interval_s: float = 0.5
+    # Sweeper: how often to run check_ledger and export the violation count; 0 = off.
+    ledger_check_interval_s: float = 300.0
+    # Gateway: on SIGTERM, how long streams get before uvicorn cancels them.
+    shutdown_grace_s: float = 20.0
 
     def __post_init__(self) -> None:
         if self.log_format not in ("console", "json"):
@@ -60,10 +68,12 @@ class Settings:
             raise ValueError("hold_ttl_s must exceed upstream_timeout_s + settle_timeout_s")
         positive = (
             self.job_max_attempts, self.job_ttl_s, self.job_lease_s, self.job_heartbeat_s,
-            self.worker_concurrency, self.worker_poll_s,
+            self.worker_concurrency, self.worker_poll_s, self.loop_lag_interval_s,
         )
         if any(x <= 0 for x in positive):
             raise ValueError("job and worker settings must be positive")
+        if self.ledger_check_interval_s < 0 or self.shutdown_grace_s < 0:
+            raise ValueError("ledger_check_interval_s and shutdown_grace_s must be non-negative")
         if self.job_retry_base_s < 0 or self.job_retry_cap_s < self.job_retry_base_s:
             raise ValueError("job_retry_cap_s must be at least job_retry_base_s, both non-negative")
         if self.job_heartbeat_s * 2 > self.job_lease_s:
@@ -120,4 +130,9 @@ def load() -> Settings:
         worker_id=env("LLMGW_WORKER_ID") or f"{socket.gethostname()}:{os.getpid()}",
         log_format=env("LLMGW_LOG_FORMAT", "console"),
         log_level=env("LLMGW_LOG_LEVEL", "info"),
+        metrics_port=_opt_int(env("LLMGW_METRICS_PORT")),
+        metrics_host=env("LLMGW_METRICS_HOST", "0.0.0.0"),
+        loop_lag_interval_s=float(env("LLMGW_LOOP_LAG_INTERVAL_S", "0.5")),
+        ledger_check_interval_s=float(env("LLMGW_LEDGER_CHECK_INTERVAL_S", "300")),
+        shutdown_grace_s=float(env("LLMGW_SHUTDOWN_GRACE_S", "20")),
     )
