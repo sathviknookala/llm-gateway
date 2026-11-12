@@ -9,10 +9,12 @@ dependencies = [
     "asyncpg>=0.30",
     "httpx>=0.28.1",
     "orjson>=3.13.0",
+    "prometheus-client>=0.26.0",
     "redis>=5",
     "starlette>=1.10.0",
     "structlog>=24.4",
     "uvicorn>=0.54.0",
+    "uvloop>=0.23.0",
 ]
 
 [project.scripts]
