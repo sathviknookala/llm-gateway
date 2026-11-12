@@ -6,7 +6,7 @@
 # provider, Prometheus and Grafana:
 #   docker compose --profile stack up -d --build [--scale worker=2]
 # Deploy overlay: deploy/docker-compose.deploy.yml. Fault overlay:
-# docker-compose.faults.yml.
+# docker-compose.faults.yml. Load generator: profile `bench` (bench/run_load.py).
 
 x-llmgw: &llmgw
   build: .
@@ -138,6 +138,13 @@ services:
       - "127.0.0.1:3000:3000"
     depends_on:
       - prometheus
+
+  # Load generator (profile: bench); bench/run_load.py drives it.
+  k6:
+    image: grafana/k6:0.55.0
+    profiles: [bench]
+    volumes:
+      - ./bench:/bench
 
 volumes:
   pgdata:
