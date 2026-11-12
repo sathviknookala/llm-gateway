@@ -1,0 +1,15 @@
+# TLS from Let's Encrypt for LLMGW_DOMAIN; the gateway is the only upstream.
+{$LLMGW_DOMAIN} {
+	# Metrics stay on the private network (Prometheus scrapes gateway:8000 directly).
+	@metrics path /metrics
+	respond @metrics 404
+
+	reverse_proxy gateway:8000 {
+		# Server-sent events: pass every chunk through as it arrives.
+		flush_interval -1
+		transport http {
+			# Longer than the gateway's whole-stream deadline (LLMGW_UPSTREAM_TIMEOUT_S, 600 s).
+			read_timeout 15m
+		}
+	}
+}

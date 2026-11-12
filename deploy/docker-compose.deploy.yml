@@ -1,0 +1,64 @@
+# Deploy overlay for a single VM:
+#   docker compose -f docker-compose.yml -f deploy/docker-compose.deploy.yml --profile stack up -d --build
+# Reads LLMGW_DOMAIN, LLMGW_PG_PASSWORD and LLMGW_GRAFANA_PASSWORD from .env next
+# to docker-compose.yml (gitignored). Every use is `:?`, so a missing value fails
+# `config` and `up` instead of starting with an empty password.
+#
+# Only Caddy publishes ports. `!reset` is needed because Compose merges `ports`
+# lists across files, and Docker-published ports bypass host firewalls.
+
+x-db-url: &db-url postgresql://llmgw:${LLMGW_PG_PASSWORD:?set LLMGW_PG_PASSWORD in .env}@postgres:5432/llmgw
+
+services:
+  postgres:
+    restart: unless-stopped
+    environment:
+      # Read only when the pgdata volume is first initialised: set it before the first `up`.
+      POSTGRES_PASSWORD: ${LLMGW_PG_PASSWORD:?set LLMGW_PG_PASSWORD in .env}
+    ports: !reset []
+
+  redis:
+    restart: unless-stopped
+    ports: !reset []
+
+  flyway:
+    command: -url=jdbc:postgresql://postgres:5432/llmgw -user=llmgw -password=${LLMGW_PG_PASSWORD:?set LLMGW_PG_PASSWORD in .env} -connectRetries=10 migrate
+
+  gateway:
+    environment:
+      LLMGW_DATABASE_URL: *db-url
+    ports: !reset []
+
+  worker:
+    environment:
+      LLMGW_DATABASE_URL: *db-url
+
+  sweeper:
+    environment:
+      LLMGW_DATABASE_URL: *db-url
+
+  grafana:
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${LLMGW_GRAFANA_PASSWORD:?set LLMGW_GRAFANA_PASSWORD in .env}
+
+  caddy:
+    image: caddy:2.8.4
+    profiles: [stack]
+    restart: unless-stopped
+    environment:
+      LLMGW_DOMAIN: ${LLMGW_DOMAIN:?set LLMGW_DOMAIN in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+volumes:
+  caddy_data:
+  caddy_config:
