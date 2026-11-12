@@ -1,4 +1,4 @@
-"""Settings guards for the job queue."""
+"""Settings guards."""
 
 import pytest
 
@@ -21,6 +21,7 @@ def test_defaults_are_valid():
         {"worker_concurrency": 0},
         {"job_retry_base_s": 10, "job_retry_cap_s": 5},
         {"job_retry_base_s": -1},
+        {"log_format": "xml"},
     ],
 )
 def test_rejects_bad_job_settings(bad):
