@@ -40,6 +40,7 @@ import httpx
 import orjson
 import structlog
 
+from llmgw import looplag, metrics
 from llmgw.config import Settings
 from llmgw.db import transaction
 from llmgw.gateway.meter import StreamMeter
@@ -71,6 +72,7 @@ class _Attempt:
     lease_lost: bool = False
     error: str | None = None  # what cut the call short, if anything
     refusal: str | None = None  # refused before sending: permanent
+    hold_closed: bool = False  # the hold was closed by another path before the finish
     requeue_after_s: float | None = None  # rate limited before sending
 
     @property
@@ -143,6 +145,9 @@ class Worker:
             return None
         # Bound for the call and the finish: the finish task copies this context.
         with structlog.contextvars.bound_contextvars(job_id=job.id, attempt=job.attempts, lease_token=job.lease_token):
+            # Both timestamps are from the database clock: locked_until = now() + lease_s.
+            waited = (job.locked_until - job.run_after).total_seconds() - s.job_lease_s
+            metrics.JOB_QUEUE_WAIT.observe(max(0.0, waited))
             log.info("job_leased", job_id=job.id, attempt=job.attempts, token=job.lease_token)
             a = _Attempt(job, s.prices.get(job.model), job.prompt_estimate + job.max_tokens)
             try:
@@ -187,13 +192,16 @@ class Worker:
                         await self._stream(a)
                 except TimeoutError:
                     a.error = "upstream_timeout"
+                    metrics.UPSTREAM_ERRORS.labels("job", "timeout").inc()
                 except httpx.TransportError as e:
                     a.error = "upstream_cut"
+                    metrics.UPSTREAM_ERRORS.labels("job", "cut").inc()
                     log.warning("upstream_cut", job_id=a.job.id, error=repr(e))
                 tg.cancel_scope.cancel()
         except* LeaseLost:
             a.lease_lost = True
             a.error = "lease_lost"
+            metrics.LEASE_LOST.inc()
             log.warning("lease_lost", job_id=a.job.id, token=a.job.lease_token)
 
     async def _heartbeat(self, a: _Attempt) -> None:
@@ -232,11 +240,15 @@ class Worker:
             resp = await self.http.send(req, stream=True)
         except (httpx.ConnectError, httpx.ConnectTimeout) as e:
             a.unreachable = True
+            metrics.UPSTREAM_ERRORS.labels("job", "unreachable").inc()
             log.warning("upstream_unreachable", job_id=a.job.id, error=repr(e))
             return
         try:
             a.status = resp.status_code
             if resp.status_code != 200:
+                kind = "status_429" if resp.status_code == 429 else (
+                    "status_4xx" if 400 <= resp.status_code < 500 else "status_5xx")
+                metrics.UPSTREAM_ERRORS.labels("job", kind).inc()
                 a.retry_after_s = _retry_after(resp.headers.get("retry-after"))
                 await resp.aread()
                 return
@@ -260,16 +272,35 @@ class Worker:
         """Record the attempt, then refund unused tokens. Never raises."""
         try:
             outcome = await self._record(a)
+            self._count_close(a, outcome)
         except Exception:
             # Left running: the lease expires and the sweeper reclaims it.
+            metrics.JOB_FINISH_FAILURES.inc()
             log.exception("job_finish_failed", job_id=a.job.id, attempt=a.job.attempts)
             outcome = Outcome.LOST
+        metrics.JOB_ATTEMPTS.labels(str(outcome)).inc()
         if a.debited and self.limiter is not None:
             unused = max(0, a.reserved_tokens - self._used_tokens(a))
             if unused:
                 with anyio.CancelScope(shield=True):
                     await self.limiter.refund(a.job.team_id, a.job.model, unused)
         return outcome
+
+    @staticmethod
+    def _count_close(a: _Attempt, outcome: Outcome) -> None:
+        """Count the hold close this finish committed, from what this worker knows.
+
+        No read after the commit: another worker may have finished the job since.
+        A replayed finish returns the same outcome, so it counts the same.
+        """
+        if outcome is Outcome.SUCCEEDED:
+            flagged = a.meter.usage is None
+            metrics.HOLD_CLOSES.labels("job", "settle", str(flagged).lower()).inc()
+        elif outcome is Outcome.PERMANENT and not a.hold_closed:
+            metrics.HOLD_CLOSES.labels("job", "release", "false").inc()
+        elif outcome is Outcome.RETRYABLE and a.job.attempts >= a.job.max_attempts:
+            # fail_attempt's dead-letter test, on the row it locked; a stale finish is FENCED.
+            metrics.HOLD_CLOSES.labels("job", "release", "false").inc()
 
     async def _record(self, a: _Attempt) -> Outcome:
         with anyio.fail_after(self.settings.settle_timeout_s):
@@ -330,6 +361,7 @@ class Worker:
             except InvalidHoldState:
                 # The hold was closed by another path; its provider cost goes to reconciliation.
                 log.error("job_hold_closed", job_id=job.id, hold_id=job.hold_id)
+                a.hold_closed = True
                 return await fail(permanent=True, cost_=0, flagged=False, error="hold_closed")
         return await fail(permanent=False, cost_=a.counted_cost, flagged=True, error=a.error or "interrupted")
 
@@ -355,5 +387,11 @@ async def _resources(settings: Settings):
 
 async def serve(settings: Settings) -> None:
     """`llmgw worker`: run until cancelled; resources close only after the drain."""
+    if settings.metrics_port is not None:
+        metrics.serve(settings.metrics_port, settings.metrics_host)
     async with _resources(settings) as worker:
-        await worker.run()
+        lag = asyncio.create_task(looplag.monitor(settings.loop_lag_interval_s))
+        try:
+            await worker.run()
+        finally:
+            await looplag.stop(lag)
